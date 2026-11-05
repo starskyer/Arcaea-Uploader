@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arcaea-uploader"
+version = "0.1.0"
+description = "Desktop resource update assistant for self-hosted Arcaea servers"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["Pillow>=10"]
+authors = [{name = "StarSkyer"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Utilities",
+]
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "twine>=5", "PyYAML>=6"]
+windows = ["pyinstaller>=6.12; sys_platform == 'win32'"]
+
+[project.urls]
+Repository = "https://github.com/starskyer/Arcaea-Uploader"
+Issues = "https://github.com/starskyer/Arcaea-Uploader/issues"
+Releases = "https://github.com/starskyer/Arcaea-Uploader/releases"
+
+[project.scripts]
+arcaea-uploader = "arcaea_uploader.__main__:main"
+
+[project.gui-scripts]
+arcaea-uploader-gui = "arcaea_uploader.gui:launch"
+
+[tool.setuptools.packages.find]
+include = ["arcaea_uploader*"]
+
+[tool.setuptools.package-data]
+"arcaea_uploader._vendor.arcaea_bundler" = ["LICENSE", "UPSTREAM.json"]
+"arcaea_uploader._legacy" = ["ORIGIN.json"]
+
+[tool.setuptools.data-files]
+"share/arcaea-uploader" = ["THIRD_PARTY_NOTICES.md", "config.example.json"]

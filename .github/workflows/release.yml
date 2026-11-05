@@ -1,0 +1,39 @@
+name: Preview release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e ".[dev,windows]"
+      - name: Verify tag matches application version
+        run: python -c "import os; from arcaea_uploader import __version__; assert os.environ['RELEASE_TAG'] == 'v' + __version__"
+      - run: python -m unittest discover -s tests -q
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - run: python scripts/build_windows.py
+      - run: python scripts/check_distribution.py dist --write-checksums
+      - name: Publish preview release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          $assets = Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }
+          gh release create $env:RELEASE_TAG @assets --title "Arcaea-Uploader $env:RELEASE_TAG (Preview)" --notes-file .github/RELEASE_NOTES.md --prerelease --verify-tag

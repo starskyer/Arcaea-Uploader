@@ -1,0 +1,16 @@
+name: 功能建议
+description: 描述工作流中的需求
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 目前遇到的具体问题
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 希望实现的行为与示例
+    validations:
+      required: true

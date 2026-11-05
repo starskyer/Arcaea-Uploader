@@ -1,0 +1,17 @@
+{
+  "name": "Arcaea-Bundler",
+  "author": "Lost-MSth",
+  "repository": "https://github.com/Lost-MSth/Arcaea-Bundler",
+  "revision": "2b659e230f9d03520e4df0642a0d3cf6a7e78395",
+  "revision_date": "2024-03-12T15:02:16Z",
+  "source_path": "arcaea_bundler/main.py",
+  "source_url": "https://github.com/Lost-MSth/Arcaea-Bundler/blob/2b659e230f9d03520e4df0642a0d3cf6a7e78395/arcaea_bundler/main.py",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2024 Lost-MSth",
+  "files": {
+    "main.py": "4d957881658ed9065d398816ff63ac754e78b36ffe88673b1b6e85c017c601d7",
+    "LICENSE": "5f90717edec7bd683eb4d85abebd45495890052c2e07343d7a7c929577dc5d3a"
+  },
+  "local_modifications": "None. Application integration lives outside this directory.",
+  "selection_reason": "Matches the maintainer's existing local workflow byte-for-byte; not an automatic upgrade to current upstream."
+}

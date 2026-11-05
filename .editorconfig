@@ -1,0 +1,17 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml,toml}]
+indent_size = 2
+
+# These audited snapshots retain their original bytes.
+[{arcaea_uploader/_vendor/arcaea_bundler/main.py,arcaea_uploader/_vendor/arcaea_bundler/LICENSE,arcaea_uploader/_legacy/resize_and_preview.py}]
+end_of_line = unset
+trim_trailing_whitespace = false
+insert_final_newline = false

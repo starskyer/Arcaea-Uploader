@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# Preserve audited third-party/legacy snapshot bytes on Windows checkouts.
+arcaea_uploader/_vendor/arcaea_bundler/main.py -text -whitespace
+arcaea_uploader/_vendor/arcaea_bundler/LICENSE -text -whitespace
+arcaea_uploader/_legacy/resize_and_preview.py -text -whitespace

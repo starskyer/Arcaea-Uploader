@@ -1,0 +1,14 @@
+{
+  "source": "Maintainer-provided resize_and_preview.py from the prior manual update workflow",
+  "sha256": "dc874eae650c4b155ade4b168fda30d655c18c0d25449bb775f125a8c075cee4",
+  "snapshot_modifications": "None",
+  "runtime_module": "arcaea_uploader.media",
+  "runtime_changes": [
+    "FFmpeg is configurable or discovered from PATH; no hardcoded machine path.",
+    "Thumbnail renaming runs even when already 384x384.",
+    "Preview generation can replace an existing preview explicitly.",
+    "Difficulty metadata is matched by ratingClass rather than list index.",
+    "Temporary files are cleaned and conversion errors propagate.",
+    "Full audio is preserved until the caller explicitly removes a work copy."
+  ]
+}

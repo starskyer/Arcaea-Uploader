@@ -1,0 +1,71 @@
+{
+  "import": {
+    "version": "7.2.0",
+    "background_pairs": {
+      "hime_light": "hime_conflict",
+      "mirai_light": "mirai_conflict",
+      "observer_light": "observer_conflict",
+      "nijuusei2_light": "nijuusei2_conflict",
+      "tanoc_conflict": "tanoc_light",
+      "ongeki_conflict": "ongeki_light",
+      "eden_conflict": "eden_light",
+      "omatsuri_light": "omatsuri_conflict",
+      "musedash_light": "musedash_conflict",
+      "single_conflict": "single_light",
+      "chunithmnew_light": "chunithmnew_conflict",
+      "rotaeno_conflict": "rotaeno_light",
+      "eden_append_light": "eden_append_conflict",
+      "vs_light": "vs_conflict",
+      "maimai_boss": "temptation",
+      "prelude_conflict": "prelude_light",
+      "single2_light": "single2_conflict",
+      "alice_light": "alice_conflict",
+      "wacca_conflict": "wacca_light",
+      "yugamu": "rei",
+      "byd_2_conflict": "byd_2_light",
+      "nijuusei-conflict-b": "nijuusei-light-b",
+      "lanota-light": "lanota-conflict",
+      "finale_conflict": "finale_light",
+      "chunithmthird_conflict": "chunithmthird_light",
+      "cytus_conflict": "cytus_light",
+      "maimai_light": "maimai_conflict",
+      "anima_light": "anima_conflict",
+      "ba_conflict": "ba_light",
+      "ba3_light": "ba3_conflict",
+      "nextstage_conflict": "nextstage_light",
+      "byd_conflict": "byd_light",
+      "dynamix_light": "dynamix_conflict",
+      "megarex_light": "megarex_conflict",
+      "zettai": "zettai_light",
+      "tonesphere-solarsphere": "tonesphere-darksphere"
+    },
+    "background_pairs_initialized": false,
+    "background_pair_conflicts": {}
+  },
+  "bundle": {
+    "follow_app_version": true,
+    "app_version": "7.2.0"
+  },
+  "local": {
+    "input_root": "D:/Arcaea/incoming",
+    "assets_root": "D:/Arcaea/assets",
+    "ffmpeg_path": "",
+    "server_project_root": "D:/Servers/Arcaea-server",
+    "database_relative_path": "latest version/database",
+    "release_root": "./releases",
+    "placeholder_aff": "D:/Servers/Arcaea-server/latest version/database/songs/sayonarahatsukoi/0.aff"
+  },
+  "ssh": {
+    "host": "203.0.113.10",
+    "port": 22,
+    "username": "arcaea",
+    "private_key_path": "~/.ssh/id_ed25519",
+    "known_hosts_path": "~/.ssh/known_hosts",
+    "server_project_root": "/srv/Arcaea-server",
+    "database_relative_path": "latest version/database"
+  },
+  "api": {
+    "base_url": "https://arcaea.example.com/api/v1",
+    "token_env": "ARCAEA_UPLOADER_API_TOKEN"
+  }
+}

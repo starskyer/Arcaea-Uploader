@@ -1,0 +1,30 @@
+name: 问题反馈
+description: 报告可复现的使用问题
+title: "[Bug] "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: 版本与启动方式
+      description: 例如 v0.1.0 Windows 便携版，或源码提交与 Python 版本。
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统与缩放
+      placeholder: Windows 11，200%
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤、期望与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 日志或最小复现
+      description: 请移除 Token、私钥和服务器地址，使用合成资源；不要上传完整游戏资源包。
+      render: text
