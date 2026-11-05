@@ -17,7 +17,7 @@ from test_preprocess import song_metadata, EMPTY, PLAYABLE
 class ImportDecisionsTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.input = self.root / "incoming"
         self.input.mkdir()
         self.assets = self.root / "active"

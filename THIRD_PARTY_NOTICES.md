@@ -24,4 +24,4 @@ Python/Tkinter and Pillow retain their own licenses. Python package installation
 
 FFmpeg is invoked as an external program, discovered through PATH or an explicit executable path; no FFmpeg binary is included in this repository, Python packages, or Windows portable releases.
 
-This notice grants no license to game assets. Arcaea-Uploader's own project license is not selected by this notice; the vendored component remains under its original MIT license.
+Arcaea-Uploader's own code is licensed under the MIT License, Copyright (c) 2026 StarSkyer; see the root LICENSE. The vendored component retains its original MIT license and copyright. No game assets are included or licensed by these notices.

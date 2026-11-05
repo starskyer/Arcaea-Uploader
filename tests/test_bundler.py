@@ -9,7 +9,7 @@ from arcaea_uploader.bundler import build_bundle, build_configured_bundle, valid
 class BundlerTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.assets = self.root / "完整 assets"
         (self.assets / "songs" / "dl_example").mkdir(parents=True)
         for name in ("songlist", "packlist", "unlocks"):

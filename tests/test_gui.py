@@ -15,7 +15,7 @@ from arcaea_uploader.settings import default_settings, load_settings, save_setti
 class GuiTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
-        self.workspace = Path(self.temp.name)
+        self.workspace = Path(self.temp.name).resolve()
         try:
             self.root = tk.Tk()
         except tk.TclError as exc:

@@ -60,7 +60,7 @@ class MergeTests(unittest.TestCase):
 class PlanTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.assets = self.root / "资源包 active"
         self.database = self.root / "server" / "latest version" / "database"
         self.incoming = self.root / "待更新"

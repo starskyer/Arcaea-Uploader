@@ -30,6 +30,13 @@ def check(path):
         raise ValueError("Missing Bundler license in " + path.name)
     if not any(name.endswith("THIRD_PARTY_NOTICES.md") for name in names):
         raise ValueError("Missing third-party notices in " + path.name)
+    if path.suffix == ".whl":
+        own_license = any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
+    else:
+        prefix = names[0].split("/")[0]
+        own_license = prefix + "/LICENSE" in names
+    if not own_license:
+        raise ValueError("Missing project MIT license in " + path.name)
     examples = [json.loads(data) for name, data in contents.items() if name.endswith("config.example.json")]
     for example in examples:
         if len(example["import"]["background_pairs"]) < 36:

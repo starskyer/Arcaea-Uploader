@@ -14,7 +14,7 @@ from arcaea_uploader.media import MediaError, create_preview, normalize_jacket, 
 class MediaTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
 
     def tearDown(self):
         self.temp.cleanup()

@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONUTF8: '1'
+
 jobs:
   tests:
     name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["Pillow>=10"]
 authors = [{name = "StarSkyer"}]
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "arcaea_uploader/_vendor/arcaea_bundler/LICENSE"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",

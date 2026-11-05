@@ -112,10 +112,10 @@ FFmpeg 在 PATH 中时会运行真实音频集成测试；也可设置 `ARCAEA_U
 
 内置 Bundler 的原作者为 **Lost-MSth**，许可证为 **MIT**，原 `main.py` 未修改。来源提交、文件校验和、适配边界及分发时保留许可证的方式见[组件整合说明](docs/integrated-tools.md)和[第三方声明](THIRD_PARTY_NOTICES.md)。窗口右上角“关于与授权”可以查看完整 Bundler 许可证。
 
-Python 安装包包含 Bundler 的完整 LICENSE；Windows 便携包同时带有 `licenses/` 和 `THIRD_PARTY_LICENSES.json`，保留实际随包 Python、Tcl/Tk、Pillow 等组件的许可证。内置第三方组件的 MIT 授权不等于替本项目所有自有代码选择了许可证。
+本项目自有代码采用 [MIT 许可证](LICENSE)，Copyright (c) 2026 StarSkyer。Bundler 保留 Lost-MSth 的原始 MIT 许可证与版权声明。Python 安装包包含这些许可文件；Windows 便携包同时带有 `licenses/` 和 `THIRD_PARTY_LICENSES.json`，保留实际随包 Python、Tcl/Tk、Pillow 等组件的许可证。
 
 ## 公开仓库范围
 
-仓库保存 Uploader 代码、文档与脱敏配置示例。原始曲目、assets、生成的工作区、服务端数据库和凭据不进入仓库。自有代码许可证尚待维护者选择，第三方代码保持其原始许可。
+仓库保存 Uploader 代码、文档与脱敏配置示例。原始曲目、assets、生成的工作区、服务端数据库和凭据不进入仓库。第三方代码保持其原始许可与版权声明。
 
 问题与建议通过 [Issues](https://github.com/starskyer/Arcaea-Uploader/issues) 提交；开发环境、贡献与版本发布分别见 [CONTRIBUTING](CONTRIBUTING.md)、[发布维护说明](docs/releasing.md)、[更新记录](CHANGELOG.md)。安全问题见 [SECURITY](SECURITY.md)。

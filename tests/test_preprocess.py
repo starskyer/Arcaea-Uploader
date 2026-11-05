@@ -47,7 +47,7 @@ class EmptyChartTests(unittest.TestCase):
 class PreprocessTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.incoming = self.root / "collected"
         self.incoming.mkdir()
         self.output = self.root / "releases"

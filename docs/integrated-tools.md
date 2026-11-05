@@ -34,7 +34,7 @@ python main.py b -i active -o 7.0.257.0.cb -av 7.0.257 -bv 7.0.257
 
 [上游 MIT 许可证](https://github.com/Lost-MSth/Arcaea-Bundler/blob/2b659e230f9d03520e4df0642a0d3cf6a7e78395/LICENSE) 允许使用、复制、修改、合并和分发该代码，要求副本或主要部分保留原版权声明及许可声明。因此本项目保留 `Copyright (c) 2024 Lost-MSth` 和完整 LICENSE，并在第三方说明及界面中列明来源。
 
-不需要仅因为整合 MIT 组件就将整个项目标为同一作者或同一许可证。本项目自有代码的许可证仍可另选；该选择不会替代 Bundler 的原许可。当前未擅自为维护者决定全项目许可证。
+本项目自有代码经维护者确认采用 MIT 许可证，版权人为 StarSkyer；见根目录 [LICENSE](../LICENSE)。Bundler 继续保留 Lost-MSth 的原始版权与许可，不将其标为本项目原创代码。
 
 `pyproject.toml` 将 LICENSE、来源 JSON 放进 Python 包，并将第三方说明带入 wheel；`MANIFEST.in` 也包含源码分发所需文件。未来独立 EXE 仍需带上这些文本，且应检查实际捆绑的其他依赖。本次没有捆绑 FFmpeg 二进制。
 
