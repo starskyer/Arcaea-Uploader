@@ -11,6 +11,7 @@ import sys
 from tempfile import TemporaryDirectory
 import urllib.request
 import zipfile
+from hashlib import sha256
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,15 +29,32 @@ def collect_notices(application):
         notices.append({"name": name, "version": version, "license_file": "licenses/" + filename})
 
     copy(Path(sys.base_prefix) / "LICENSE.txt", "Python", platform.python_version(), "Python.txt")
-    for package in ("Pillow", "PyInstaller"):
+    for package in ("Pillow", "PyInstaller", "paramiko", "bcrypt", "cryptography", "cffi", "pycparser", "pynacl", "invoke", "typing_extensions"):
         distribution = metadata.distribution(package)
         matches = [f for f in distribution.files or []
-                   if f.name.lower() in {"license", "license.txt", "copying.txt"}]
-        if package == "Pillow" and not matches:
-            raise RuntimeError("Pillow license files were not found")
+                   if f.name.lower().startswith(("license", "copying", "notice"))]
+        if not matches:
+            raise RuntimeError(package + " license files were not found")
         for index, item in enumerate(matches):
             copy(distribution.locate_file(item), package, distribution.version,
                  f"{package}/{index}-{item.name}")
+
+    # Distribute the exact unmodified LGPL component's corresponding source.
+    # Paramiko is collected as replaceable .py files, outside the PYZ archive.
+    version = metadata.version("paramiko")
+    with urllib.request.urlopen(f"https://pypi.org/pypi/paramiko/{version}/json", timeout=45) as response:
+        release = json.load(response)
+    source = next(item for item in release["urls"] if item["packagetype"] == "sdist")
+    with urllib.request.urlopen(source["url"], timeout=90) as response:
+        archive = response.read()
+    if sha256(archive).hexdigest() != source["digests"]["sha256"]:
+        raise RuntimeError("Paramiko source archive hash mismatch")
+    sources = application / "sources"
+    sources.mkdir()
+    (sources / source["filename"]).write_bytes(archive)
+    notices.append({"name": "paramiko corresponding source", "version": version,
+                    "source_file": "sources/" + source["filename"], "url": source["url"],
+                    "sha256": source["digests"]["sha256"]})
 
     import tkinter as tk
     window = tk.Tk()

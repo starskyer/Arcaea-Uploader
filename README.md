@@ -2,18 +2,37 @@
 
 [![CI](https://github.com/starskyer/Arcaea-Uploader/actions/workflows/ci.yml/badge.svg)](https://github.com/starskyer/Arcaea-Uploader/actions/workflows/ci.yml)
 
-基于 **Lost-MSth** 的 [Arcaea-server](https://github.com/Lost-MSth/Arcaea-server) 的服务器热更新、下载资源一键更新工具。把待更新曲目放入一个输入目录，通过紧凑窗口整理格式、检查增量资源并审核报告。目标工作流为「准备本地资源并人工审核 songlist → 打包上传 → 可选服务端操作」。
+用于 **Lost-MSth** 的 [Arcaea-server](https://github.com/Lost-MSth/Arcaea-server) 的桌面资源更新工具。把待更新曲目放入一个输入目录，通过窗口整理格式、增量准备资源并审核 songlist，再完成打包、上传与可选的服务端操作。
 
-**当前已实现桌面窗口、曲目预处理、临时工作区恢复与清理、配置保存/载入、后台资源预检、03 定数与服务端操作和报告导出。** “准备并审核”“打包并上传”按钮尚未接入完整执行逻辑，界面中禁用并标注待接入。预处理只生成工作副本，原始曲目包、待打包资源目录（以下简称 active，因为 616 下载解压到本地的热更新资源路径命名为 active）和服务端保持不变；资源预检仍为只读。
+**01 准备并审核、02 打包并上传、03 服务端操作与最终提交均已接入。** 选择曲目目录、填写 version 后可直接执行 01。工作区代表一批尚未提交的改动：01 可累积准备，02 上传成功后保留全部暂存内容，03 操作成功并人工确认提交后才清理。原始曲目包保持不变。
 
-Bundler 核心和图片/预览处理现已内置，无需另行下载 Bundler 或配置脚本路径。打包及媒体模块已单独验证，尚未接入上述两阶段按钮。
+Bundler 核心、图片/预览处理与 SSH/SFTP 客户端现已内置，无需另行下载 Bundler 或配置脚本路径。待打包资源目录下文简称 active，沿用 616 下载解压资源的目录名。
+
+## 当前进度
+
+以下为 **2026-11-07 的主分支状态**，项目仍处于预览阶段。源码进度与已发布下载包分别维护；现有 Release 的功能以其发布说明为准。
+
+| 部分 | 已实现行为 |
+| --- | --- |
+| 桌面与配置 | 更新 / 配置页、JSON 配置持久化、ⓘ 说明与示例、无向背景配对、应用版本与包名预览 |
+| 预处理与检查 | 嵌套曲目发现、格式归一、空谱排除、音频转换、曲绘补全、增量合并及 INFO / WARNING / ERROR 报告 |
+| 01 准备审核 | 准备 bundle 与下载资源，打开审核总表；同一工作区可反复追加曲目或难度，保留人工修改与删除字段 |
+| 02 打包上传 | 校验最终总表、重建预览、生成版本包、本地就位、SSH/SFTP 上传和 SHA-256 校验；失败后继续原构建 |
+| 03 可选操作 | 按序刷新资源、补购买项、写入人工定数、刷新评分；保存检查点，支持失败续跑与明确跳过 |
+| 工作区生命周期 | 跨重启恢复、多 server 配置快照、旧批次兼容、后台列表；02 后保留资源，03 验收并确认提交后清理 |
+
+最近修复了旧批次缺少 `workspace.json` 无法继续、重复 01 补回人工删除字段、难度 version 被自动生成、只读文件清理失败等问题。追加准备减少完整 active 的重复复制，日志增加阶段耗时。
+
+本轮 Windows / Python 3.10 验证共 **210 项测试，209 项通过，1 项因符号链接权限跳过**；桌面启动检查通过。测试覆盖增量与审核保留、构建和中断恢复、测试 SSH/API 服务及真实 FFmpeg 媒体处理。变更明细见 [CHANGELOG](CHANGELOG.md)。
 
 ## 当前限制与未覆盖行为
 
 以下仅记录当前状态，**不是开发路线图，也不承诺后续一定实现**；部分行为可能长期保留或最终明确不支持，后续发现的问题会继续补充。
 
-1. **不自动导入 packlist、unlocks。** 目前元数据合并规划仅覆盖 songlist。若新增曲包或解锁条件涉及 `active/songs/packlist`、`active/songs/unlocks` 等其他文档，需在执行 **02 打包上传之前**手动更新并保存，确保这些信息随 bundle 一起打包。
+1. **不自动导入 packlist、unlocks。** 目前元数据合并仅覆盖 songlist。若新增曲包或解锁条件涉及 `active/songs/packlist`、`active/songs/unlocks` 等其他文档，需在执行 **02 打包上传之前**手动更新并保存。可编辑原 active 或本批审核副本；两边同时改成不同内容会报错，需人工统一。
 2. **尚未实现本机部署的完整更新模式。** 02/03 目前围绕另一台主机上的 Arcaea-server 组织流程，文件上传默认使用 SSH。SSH 服务器 IP / 主机名留空不会自动切换为本机模式，完整上传任务仍无法进行。03 的独立入口通过配置的管理 API 调用，不建立 SSH 连接；这不代表已经支持本机资源就位、数据库处理等完整流程。
+3. **连接方式有明确范围。** 当前 SSH 上传采用私钥认证，尚无密码登录输入框，也不支持其他传输协议。03 使用管理 API Token 环境变量，尚未提供 API 账号密码登录界面；旧 Web 管理页的登录状态不能直接用于这里。
+4. **部分资源仍需人工处理。** 自定义 WAV 音效仅告警、不分发；未知背景尺寸会阻止发布；非标准独立难度音频的下载声明仍需核对。扩展名与实际编码不符时不专门识别、修复或告警，具体边界见下文及[曲目资源规则](docs/song-packages.md)。
 
 ![桌面界面示例，使用示例路径](docs/assets/desktop.png)
 
@@ -31,13 +50,23 @@ python -m pip install -e .
 
 Windows 已关联 Python `.pyw` 时，双击项目中的 `Arcaea-Uploader.pyw` 即可打开窗口，不显示控制台；也可使用安装后的 `arcaea-uploader-gui` 入口，或执行 `python -m arcaea_uploader`。
 
-- **更新页**：选择收集曲目的来源目录，填写“本次导入 version”，点击“预处理曲目”整理嵌套、songlist/slst、曲绘、音频和空谱；随后“检查资源”检查本次标准副本。滚动日志按 INFO / WARNING / ERROR 显示，结果可导出 JSON 报告。
-- **临时工作区**：底部“工作区管理…”可查看报告、跨重启继续预处理、打开目录或删除批次。修复原始包后只重做变化部分，复用校验通过的成功副本；失败批次保留。完整发布接入后，核验成功才清理临时大文件，详见[工作区管理](docs/workspaces.md)。
+- **更新页**：选择收集曲目的来源目录，填写“本次导入 version”，点击 01；审核保存总表后点击 02。预处理和检查是辅助入口。滚动日志按 INFO / WARNING / ERROR 显示，结果可导出 JSON 报告。
+- **临时工作区**：启动时提示未提交的工作区；新选目录时可选择继续累积或明确新建独立工作区。工作区管理可恢复各自的服务器配置和进度，同时处理不同 server。文件、占位谱面、定数草稿与购买候选都保留到 03 的最终提交，详见[工作区管理](docs/workspaces.md)。
 - **配置页**：填写本地 Arcaea-server、active、曲目输入目录、发布工作区；填写 SSH 主机、端口、用户名、服务器项目路径、密钥及刷新 API 设置。路径可浏览选择，配置在同一页滚动查看。FFmpeg 仍为外部程序，可指定路径，或留空从 PATH 查找。
 - 点击“保存配置”后，下次打开会恢复设置；也可载入已有 JSON 配置或另存。曲目目录和导入 version 在两页同步；“背景对应表…”可查看、编辑或重新读取 active 总表中的翻转关系。
 - “沿用当前应用版本”默认勾选，输入框锁定并显示从 Bundler 历史识别的应用版本；取消后填写新应用版本，窗口预览 `.0` 承接包名称。该设置保存在 `bundle` 配置组，与曲目导入 version 分开。
 
 开发目录存在被忽略的 `config.local.json` 时优先使用；否则默认配置保存于用户本地应用数据目录的 `Arcaea-Uploader/config.json`。可用 `python -m arcaea_uploader gui --config <路径>` 明确指定。配置页允许先保存不完整的信息；资源预检时再校验本地路径，不要求提供 VPS 凭据。详见[桌面界面说明](docs/desktop.md)。
+
+### 首次配置与使用
+
+1. 在配置页指定本地 Arcaea-server 项目根目录、待打包的 active、曲目来源目录和临时工作区。`database_relative_path` 默认是 `latest version/database`；占位谱默认取该 database 下的 `songs/sayonarahatsukoi/0.aff`，也可另选一个仅含 timing 的空谱。
+2. 配置 FFmpeg；为 02 填写 SSH 主机、端口（默认 22）、用户名、私钥、known_hosts 和 VPS 上的项目根目录，例如 `/srv/Arcaea-server`。首次连接会要求确认主机指纹。
+3. 如需 03，配置管理 API 前缀，例如 `https://arc.example.com/api/v1`。`token_env` 填环境变量**名称**，实际值须与服务端认可的管理 Token 一致，设置方法见 [API 鉴权说明](docs/api-auth.md)。
+4. 保存配置，在更新页填写本次导入 version，执行 01，检查日志并保存打开的工作区 songlist。如还需补资源，可换来源目录后继续 01；确认完整后再执行 02。
+5. 在下方录入已知定数，选择 03 操作并执行。验收成功后点击“提交并清理…”。不需要 API 操作时，将其全部关闭并明确执行跳过，再确认提交。
+
+只使用 01 时可以暂不填写 SSH/API。配置、背景对应表可直接编辑 JSON；工作区和任务进度保存在 `local.release_root`，无需依赖窗口一直开着。
 
 ## 收集曲目预处理
 
@@ -45,7 +74,7 @@ Windows 已关联 Python `.pyw` 时，双击项目中的 `Arcaea-Uploader.pyw` �
 
 已有总表可按精确 ID 补全缺失信息；新曲目描述缺失、同 ID 多来源或资源冲突会列为待处理，不凭空生成作者、定级和预览时间。详见[预处理规则](docs/preprocessing.md)。
 
-目前版本导入 version 必填，强制覆盖本批曲目及其声明难度的 version，包括原始未填写的情况；同时设置 `remote_dl: true`。这个值用于 songlist；bundle 应用版本单独设置，命名规则见下文。背景对应表首次从 **所选bundle目录（active）** 的 `songs/songlist` 初始化，按无向关系一一配对；配置中只写一次 `"A": "B"`，即可从任意一边查到另一边。未明确填写 `bg_inverse` 时优先查表，再尝试 `_light` / `_conflict` 后缀规则，有歧义则 WARNING 提醒人工确认。
+目前版本导入 version 必填，强制覆盖本批曲目顶层的 version，包括原始未填写的情况；不再为 `difficulties` 新增或强制覆盖 version，已存在的难度 version 保留。同时设置 `remote_dl: true`。这个值用于 songlist；bundle 应用版本单独设置，命名规则见下文。背景对应表首次从 **所选bundle目录（active）** 的 `songs/songlist` 初始化，按无向关系一一配对；配置中只写一次 `"A": "B"`，即可从任意一边查到另一边。未明确填写 `bg_inverse` 时优先查表，再尝试 `_light` / `_conflict` 后缀规则，有歧义则 WARNING 提醒人工确认。
 
 [config.example.json](config.example.json) 包含当前维护的背景配对，可直接查看、载入并按自己的资源调整；不包含背景图片。其本地路径、服务器地址均为示例。
 
@@ -57,13 +86,23 @@ INFO 表示可自动处理且无需人工检查；WARNING 表示可继续处理�
 
 ## 三阶段更新
 
-1. **准备并审核（第一步按钮，待实现）**：扫描所有输入曲目，增量准备服务端下载文件及 bundle 曲绘、背景和预览，自动合并总 songlist、输出冲突报告；准备结束后用记事本打开 songlist，交由人工检查和保存。
-2. **打包上传（02，待实现）**：校验人工保存的 songlist 和资源，按需重建预览、生成 bundle，先安装到本地 database，再通过 SSH 上传并核验；保存独立 03 任务后清理临时大文件。
-3. **服务端操作（03，可选，已接入）**：按序刷新 bundle/songs/world map、补充缺少的购买项、写入人工定数、刷新成绩评分。定数可以暂时留空，未填时提示并保留已有值；新增记录暂用 -1。当前也可用于已手动上传的批次，详见[03 操作](docs/server-operations.md)。
+1. **准备并审核（01）**：扫描所有输入曲目，增量准备服务端下载文件及 bundle 曲绘、背景和预览，自动合并总 songlist、输出冲突报告；准备结束后用记事本打开**本批工作区**的 songlist，交由人工检查和保存。此阶段不改原 active、本地 server 或 VPS。
+2. **打包上传（02）**：校验人工保存的 songlist、输入和资源基线，按需重建预览、生成 bundle，先安装本地，再通过 SSH 上传核验。完成后标记“已上传，待 03”，完整工作区继续保留；失败时复用原构建继续。
+3. **服务端与提交（03）**：按选项刷新资源、补购买、写定数、刷新评分。操作完成后验收，点击“提交并清理…”才销毁临时工作区。API 操作可以部分或全部明确跳过；最终提交仍需确认。定数暂缺时保留已有值，新增记录用 -1；修改已完成任务的定数或选项后，需重新执行 03。详见[03 操作](docs/server-operations.md)。
+
+**未开始打包时，01 可以反复追加到同一个批次。** 换目录或在原目录放入新资源后再次执行 01，会保留先前已准备的曲目、已保存的人工 songlist 修改及 packlist / unlocks，合入新曲目或新难度；总表路径不变，idx 不重复分配。追加前先保存并关闭正在编辑的总表，完成后重新打开。各轮采用同一 version 和应用版本选项，直到确认完整后再执行一次 02。需要独立更新时点击“新建批次…”，原批次仍可从工作区管理中继续。
+
+人工审核优先于再次扫描的原始单曲 songlist，既保留改过的值，也保留主动删除的字段，并在后续多轮 01 中持续生效。只保存原始曲目包中的 songlist 不等于审核工作区总表；01 打开和 02 使用的是 `<release_root>/<批次>/prepared/active/songs/songlist`。
+
+追加发生 ERROR 时保留原工作区并阻止 02，请修复该待追加目录后重试；不会静默只发布此前成功的部分。02 开始打包后固定本批构建，不能继续追加。详细规则见[工作区管理](docs/workspaces.md)。
+
+关闭后通过“工作区管理…”继续原批次，可恢复配置、资源、定数草稿和操作进度。缺少 `workspace.json` 的旧批次只要报告有效也可恢复，继续保存时补建标记。首次 01 会复制并校验完整 active，因此耗时还取决于已有资源大小和磁盘速度；追加时复用工作区内未变化的资源，界面日志显示当前阶段及耗时。
+
+“未提交”表示整批流程尚未验收完成。02 已经会安装与上传文件，03 也可能完成部分 API 操作；放弃工作区不会撤销这些已执行的变更。手动放弃需要单独确认。
 
 songlist 冲突保留原值并报告，供审核时修改；未知背景尺寸阻止该批次发布。完整阶段边界见[三阶段更新流程](docs/update-workflow.md)。
 
-bundle 采用两种命名规则，内置适配层已实现，发布按钮仍待接入：
+bundle 采用两种命名规则：
 
 | 模式 | JSON 版本 | 文件名前缀 |
 | --- | --- | --- |
@@ -74,14 +113,14 @@ bundle 采用两种命名规则，内置适配层已实现，发布按钮仍待�
 
 ## 曲目如何分流
 
-输入目录的每个直接子目录就是一个原始曲目 ID，例如 `incoming/example/`。完整新曲目一般包含数字 `.aff`、`base.ogg`、`base.jpg`、`base_256.jpg` 和 songlist；已有曲目允许只提交新增文件及 songlist 补丁。
+输入目录可直接包含曲目文件夹，例如 `incoming/example/`，也可有多层外包装目录；预处理按 songlist.id 识别曲目并生成标准工作副本。完整新曲目一般包含数字 `.aff`、`base.ogg`、`base.jpg`、`base_256.jpg` 和 songlist；已有曲目允许只提交新增文件及 songlist 补丁。
 
 | 输入内容 | bundle 资源包侧 | 服务端 `latest version/database` 侧 |
 | --- | --- | --- |
 | 曲目 songlist | 合并至 `songs/songlist`，新曲目 `idx = max(idx) + 1` | 当前不自动写入 `songs/songlist` |
 | 曲绘 JPG | `songs/dl_<id>/`，随后规范化名称与尺寸 | 不保留 |
 | 自定义背景 JPG | 1920×1440 → `img/bg/1080/`；1440×1080、1280×960 → `img/bg/` | 不保留 |
-| `base.ogg`、`0–4.ogg` | 准备预览；独立音频的兼容规则待补充 | `songs/<id>/` 保留完整音频 |
+| `base.ogg`、`0–4.ogg` | 生成 `preview.ogg` 或 `<难度>_preview.ogg`；非 `3.ogg` 的独立难度音频报告兼容性 WARNING | `songs/<id>/` 保留完整音频 |
 | `0–4.aff` | 不保留 | `songs/<id>/`；只对实际缺失的 `0–2.aff` 补占位 |
 | `video_1080.mp4` | 不保留 | `songs/<id>/` 原样保留 |
 
@@ -100,7 +139,7 @@ Copy-Item config.example.json config.local.json
 python -m arcaea_uploader plan --config config.local.json > plan.local.json
 ```
 
-`plan` 当前使用 `local.input_root`、`assets_root`、`server_project_root`、`database_relative_path`、`placeholder_aff` 及 `import` 规则。相对路径以配置文件所在目录为基准。FFmpeg 用于预处理音频转换；SSH 字段为后续文件上传预留，API 已供 03 使用，预检不连接 VPS，也不要求配置凭据。旧配置中的 `bundler_entry`、`bundler_root`、`media_script` 在载入时忽略，保存时移除，其余配置保留。
+`plan` 使用 `local.input_root`、`assets_root`、`server_project_root`、`database_relative_path`、`placeholder_aff` 及 `import` 规则。相对路径以配置文件所在目录为基准。FFmpeg 用于音频转换与预览，SSH 用于 02 上传，API 用于 03；只读预检不连接 VPS，也不要求配置凭据。旧配置中的 `bundler_entry`、`bundler_root`、`media_script` 在载入时忽略，保存时移除，其余配置保留。
 
 报告包含 songlist 合并草案、字段冲突、资源去向、下载文件哈希差异、占位谱面和预览任务。图片/音频条目标为 `prepare_media`，尚未转换，不能视为最终上传差异。缺失或冲突会报告，`publishable` 始终为 `false`，必须经过后续人工审核和执行阶段。
 
@@ -111,7 +150,7 @@ python -m arcaea_uploader plan --config config.local.json > plan.local.json
 - [Arcaea-Bundler](https://github.com/Lost-MSth/Arcaea-Bundler)：生成 `.cb` 与配套 `.json`，维护 `metadata.oldjson` 增量历史。MIT 许可，内置与现有本地副本完全相同的固定版本，保留作者 Lost-MSth 的版权声明和完整许可证。
 - [Arcaea-server](https://github.com/Lost-MSth/Arcaea-server)：下载资源目录、bundle 版本索引及刷新管理 API。
 - 内置媒体模块：由维护者提供的 `resize_and_preview.py` 整理而来，保留原始快照，修复缩略图漏改名、预览重建和难度查找问题；完整源音频由调用方保留。
-- SSH / SFTP：后续只通过 SSH 连接 VPS，端口默认 `22`；服务器项目根路径可指定。
+- SSH / SFTP：通过 SSH 连接 VPS，端口默认 `22`；服务器项目根路径可指定，采用私钥认证并核对主机指纹。
 
 行为依据本地副本核对，详见[工具调查](docs/existing-tools.md)。运行验证：
 
@@ -120,6 +159,8 @@ python -m unittest discover -s tests -v
 ```
 
 FFmpeg 在 PATH 中时会运行真实音频集成测试；也可设置 `ARCAEA_UPLOADER_TEST_FFMPEG` 指定测试用可执行文件。没有 FFmpeg 时仅跳过该集成测试。
+
+CI 在 Windows / Linux 与 Python 3.10 / 3.13 检查代码，并验证 Python 分发包内容。Windows 便携版的构建和 Release 流程已配置；推送主分支不会自动生成新 Release，需另行更新版本并推送对应标签。
 
 ## 第三方授权
 

@@ -21,7 +21,7 @@ python -m venv .venv
 .venv\Scripts\python scripts/check_distribution.py dist --write-checksums
 ```
 
-Windows 构建须使用 64 位 Windows Python。脚本在独立临时工作区运行 PyInstaller，复制使用文档、示例配置和运行时许可证，启动 EXE 做 Tk、Pillow、Bundler 来源及版本逻辑的冒烟检查，再生成 ZIP。部分 Python 安装器未附 Tcl 独立许可证时，会从 Tcl 官方仓库取得相同运行时版本的许可证。
+Windows 构建须使用 64 位 Windows Python。脚本在独立临时工作区运行 PyInstaller，复制文档、示例配置和全部依赖许可证，启动 EXE 做 Tk、Pillow、Bundler、SSH 加密后端和三个阶段入口的冒烟检查，再生成 ZIP。Paramiko 以可替换的 `.py` 文件保留在 `_internal/paramiko`，并从 PyPI 下载精确版本的完整源码归档，核对 SHA-256 后附于 `sources/`；这些许可与源码需随便携包一并分发。部分 Python 安装器未附 Tcl 独立许可证时，会从 Tcl 官方仓库取得相同运行时版本的许可证。
 
 `dist/` 中的主要产物：
 
@@ -39,4 +39,4 @@ Windows 构建须使用 64 位 Windows Python。脚本在独立临时工作区�
 3. 创建并推送对应标签，例如 `git tag v0.1.0`、`git push origin v0.1.0`。
 4. 检查 Preview release 工作流及 Releases 附件，在干净环境解压运行验证。
 
-当前流程始终标为预发布。未来完整更新流程实现后，再调整稳定版策略；GitHub 自动生成的 Source code ZIP 不包含可运行的 EXE。
+当前流程始终标为预发布。完整三阶段已经接入，稳定版策略仍需在后续实机验收后单独决定；GitHub 自动生成的 Source code ZIP 不包含可运行的 EXE。

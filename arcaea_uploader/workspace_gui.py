@@ -2,20 +2,26 @@
 
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import subprocess
 import sys
+from threading import Thread
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from .workspaces import delete_workspace, list_workspaces, load_workspace
+from .workspaces import delete_workspace, load_workspace
+from .workspace_session import entries as session_entries
 
 
 class WorkspaceManager:
     def __init__(self, app):
         self.app = app
         self.entries = {}
+        self.loading = False
+        self.poll_id = None
+        self.queue = Queue()
         self.window = tk.Toplevel(app.root)
-        self.window.title("临时工作区管理")
+        self.window.title("未提交工作区管理")
         self.window.transient(app.root)
         width, height = app.px(780), app.px(440)
         x = max(0, min(app.root.winfo_rootx() + (app.root.winfo_width() - width) // 2,
@@ -28,7 +34,7 @@ class WorkspaceManager:
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(2, weight=1)
-        hint = ttk.Label(body, text="预处理也会创建临时批次。失败批次保留；修复原始包后可在同一批次继续。",
+        hint = ttk.Label(body, text="01 可累积准备，02 上传后仍保留；03 完成并确认提交后才清理。",
                          wraplength=app.px(700))
         hint.grid(row=0, column=0, sticky="ew", pady=(0, app.px(6)))
         self.location = tk.StringVar()
@@ -36,9 +42,9 @@ class WorkspaceManager:
         location_label.grid(row=1, column=0, sticky="ew", pady=(0, app.px(8)))
         listing = ttk.Frame(body)
         listing.grid(row=2, column=0, sticky="nsew")
-        columns = ("name", "state", "songs", "errors")
+        columns = ("name", "state", "songs", "errors", "server")
         self.tree = ttk.Treeview(listing, columns=columns, show="headings", selectmode="browse")
-        for key, label, width in zip(columns, ("批次", "状态", "已标准化", "ERROR"), (260, 180, 85, 65)):
+        for key, label, width in zip(columns, ("批次", "状态", "曲目", "ERROR", "服务端"), (210, 180, 65, 60, 170)):
             self.tree.heading(key, text=label)
             self.tree.column(key, width=app.px(width), minwidth=app.px(60), stretch=key in {"name", "state"})
         scrollbar = ttk.Scrollbar(listing, command=self.tree.yview)
@@ -55,10 +61,10 @@ class WorkspaceManager:
         self.window.bind("<Configure>", resized)
         actions = ttk.Frame(body)
         actions.grid(row=4, column=0, sticky="ew")
-        self.resume_button = ttk.Button(actions, text="继续预处理", command=self.resume)
+        self.resume_button = ttk.Button(actions, text="继续所选批次", command=self.resume)
         self.view_button = ttk.Button(actions, text="查看报告", command=self.view)
         self.open_button = ttk.Button(actions, text="打开目录", command=self.open_folder)
-        self.delete_button = ttk.Button(actions, text="删除批次…", command=self.delete)
+        self.delete_button = ttk.Button(actions, text="放弃工作区…", command=self.delete)
         for button in (self.resume_button, self.view_button, self.open_button, self.delete_button):
             button.pack(side="left", padx=(0, app.px(6)))
         ttk.Button(actions, text="刷新列表", command=self.refresh).pack(side="right")
@@ -70,28 +76,52 @@ class WorkspaceManager:
         self.window.minsize(max(app.px(620), actions.winfo_reqwidth() + app.px(28)), app.px(340))
 
     def close(self):
+        if self.poll_id:
+            self.window.after_cancel(self.poll_id)
+            self.poll_id = None
         self.app.workspace_manager = None
         self.window.destroy()
 
     def refresh(self):
+        if self.loading:
+            return
         raw = self.app.variables[("local", "release_root")].get().strip()
         self.tree.delete(*self.tree.get_children())
         self.entries = {}
-        if not raw:
-            self.detail.set("请先在配置页指定发布工作区。")
-            self.select()
-            return
-        path = Path(raw).expanduser()
-        self.release_root = (self.app.config_path.parent / path).resolve() if not path.is_absolute() else path.resolve()
-        self.location.set(str(self.release_root))
+        path = Path(raw).expanduser() if raw else None
+        self.release_root = ((self.app.config_path.parent / path).resolve() if not path.is_absolute() else path.resolve()) if path else None
+        self.location.set("当前目录：" + str(self.release_root) + "；同时列出此前登记的工作区。" if path else "列出此前登记的未提交工作区。")
+        self.detail.set("正在读取工作区列表…")
+        self.loading = True
+        self.select()
+        # Capture Tk values above; the worker only reads filesystem records.
+        session, release_root = self.app.session_path, self.release_root
+        def scan():
+            try:
+                self.queue.put((session_entries(session, release_root), None))
+            except Exception as error:
+                self.queue.put(([], str(error)))
+        Thread(target=scan, daemon=True).start()
+        self.poll_id = self.window.after(25, self._poll_list)
+
+    def _poll_list(self):
+        self.poll_id = None
         try:
-            for row in list_workspaces(self.release_root):
+            rows, error = self.queue.get_nowait()
+        except Empty:
+            self.poll_id = self.window.after(25, self._poll_list)
+            return
+        self.loading = False
+        try:
+            if error:
+                raise ValueError(error)
+            for row in rows:
                 report = row["report"] or {}
                 counts = report.get("counts", {})
                 item = self.tree.insert("", "end", values=(row["name"], row["state"],
-                    counts.get("normalized", 0), len(report.get("errors", []))))
+                    counts.get("normalized", 0), len(report.get("errors", [])) + row.get("pending_errors", 0), row.get("server", "未绑定")))
                 self.entries[item] = row
-            self.detail.set("选择批次后继续将重新扫描原始包，仅复用校验通过的副本。" if self.entries
+            self.detail.set("继续所选工作区会恢复它的服务器配置、暂存内容和操作进度。" if self.entries
                             else "暂无临时批次。只查看此列表不会创建 releases 目录。")
         except (OSError, ValueError) as exc:
             self.detail.set(str(exc))
@@ -110,7 +140,7 @@ class WorkspaceManager:
         self.delete_button.configure(state="normal" if row and row["managed"] and not self.app.busy else "disabled")
         if row:
             self.detail.set(row["error"] or "输入：" + row["report"]["input_root"] +
-                            "\n继续使用该批次的输入目录和 version，其余采用当前配置；变更项会重新核验。")
+                            "\n服务端：" + row.get("server", "未绑定") + "；恢复该工作区保存的配置与进度。")
 
     def resume(self):
         row = self.selected()
@@ -124,7 +154,7 @@ class WorkspaceManager:
         if not row or self.app.busy:
             return
         try:
-            report = load_workspace(self.release_root, row["path"])
+            report = load_workspace(Path(row["path"]).parent, row["path"])
             self.app.show_workspace_report(report)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             messagebox.showerror("无法载入报告", str(exc), parent=self.window)
@@ -146,11 +176,11 @@ class WorkspaceManager:
         row = self.selected()
         if not row or not row["managed"] or self.app.busy:
             return
-        if not messagebox.askyesno("删除临时批次", "删除下列批次的全部工作副本和报告？\n\n" + row["path"] +
-                                   "\n\n删除后无法继续此批次，原始曲目包保留。", parent=self.window, default="no"):
+        if not messagebox.askyesno("放弃未提交工作区", "删除下列工作区的全部暂存内容与进度？\n\n" + row["path"] +
+                                   "\n\n已上传资源和已执行的 API 操作不会撤销；原始曲目包保留。", parent=self.window, default="no"):
             return
         try:
-            delete_workspace(self.release_root, row["path"])
+            delete_workspace(Path(row["path"]).parent, row["path"])
             self.app.forget_workspace(Path(row["path"]))
         except (OSError, ValueError) as exc:
             messagebox.showerror("无法清理工作区", str(exc), parent=self.window)

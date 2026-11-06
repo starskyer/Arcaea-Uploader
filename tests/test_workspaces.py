@@ -12,7 +12,7 @@ from PIL import Image
 from arcaea_uploader.planner import PlanError
 from arcaea_uploader.preprocess import preprocess_collection
 from arcaea_uploader.workspaces import (cleanup_published_workspace, delete_workspace,
-    list_workspaces, load_workspace, workspace_lock)
+    list_workspaces, load_workspace, workspace_lock, workspace_settings, snapshot_workspace_settings)
 from test_preprocess import PLAYABLE, song_metadata
 
 
@@ -140,6 +140,33 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(result["valid"], result["errors"])
         self.assertFalse(result["packages"][0].get("reused", False))
 
+    def test_legacy_report_restores_settings_without_marker_and_migrates_when_saved(self):
+        from arcaea_uploader.settings import default_settings
+        self.package()
+        batch = Path(self.run_batch()["batch_root"])
+        marker = batch / "workspace.json"
+        marker.unlink()
+        before = (batch / "songs/sample/songlist").read_bytes()
+        restored = workspace_settings(self.output, batch, default_settings(), self.root)
+        self.assertEqual(restored["local"]["input_root"], str(self.input))
+        self.assertEqual(restored["import"]["version"], "7.0")
+        self.assertFalse(marker.exists(), "Listing/restoring must stay read-only")
+        with workspace_lock(self.output, batch):
+            snapshot_workspace_settings(batch, restored)
+        self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["owner"], "Arcaea-Uploader")
+        self.assertEqual((batch / "songs/sample/songlist").read_bytes(), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only attribute")
+    def test_cleanup_handles_private_read_only_files(self):
+        import stat
+        self.package()
+        batch = Path(self.run_batch()["batch_root"])
+        file = batch / "songs/sample/base.jpg"
+        file.chmod(stat.S_IREAD)
+        delete_workspace(self.output, batch)
+        self.assertFalse(batch.exists())
+        self.assertTrue((self.input / "sample/base.jpg").exists())
+
     def test_cleanup_rejects_root_external_directory_and_mismatched_report(self):
         self.package()
         batch = Path(self.run_batch()["batch_root"])
@@ -179,7 +206,7 @@ class WorkspaceTests(unittest.TestCase):
         delete_workspace(self.output, batch)
         self.assertFalse(batch.exists())
 
-    def test_complete_receipt_cleans_only_batch_and_keeps_small_audit(self):
+    def test_upload_receipt_alone_never_cleans_uncommitted_workspace(self):
         self.package()
         batch = Path(self.run_batch()["batch_root"])
         receipt = {"batch_id":batch.name, "local_verified":True, "remote_verified":True, "refresh":"failed"}
@@ -188,10 +215,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(batch.exists())
         receipt["refresh"] = "succeeded"
         receipt["token"] = "must-not-be-archived"
-        archive = cleanup_published_workspace(self.output, batch, receipt)
-        self.assertFalse(batch.exists())
-        self.assertTrue(json.loads(archive.read_text(encoding="utf-8"))["cleanup_complete"])
-        self.assertNotIn("must-not-be-archived", archive.read_text(encoding="utf-8"))
+        with self.assertRaises(PlanError):
+            cleanup_published_workspace(self.output, batch, receipt)
+        self.assertTrue(batch.exists())
         self.assertTrue((self.input / "sample/2.aff").exists())
 
     def test_linked_directory_is_neither_traversed_nor_deleted(self):
@@ -209,7 +235,7 @@ class WorkspaceTests(unittest.TestCase):
         finally:
             link.unlink()
 
-    def test_stage02_cleanup_retains_verified_stage03_task_for_later(self):
+    def test_legacy_task_without_full_stage02_receipt_cannot_destroy_workspace(self):
         from arcaea_uploader.server_tasks import (confirm_uploaded, load_task, make_task,
             read_reviewed, run_task, save_task, task_path)
         from test_server_tasks import FakeAPI
@@ -231,8 +257,9 @@ class WorkspaceTests(unittest.TestCase):
             cleanup_published_workspace(self.output, batch, receipt)
         self.assertTrue(batch.exists())
         source.write_bytes(before)
-        cleanup_published_workspace(self.output, batch, receipt)
-        self.assertFalse(batch.exists())
+        with self.assertRaises(PlanError):
+            cleanup_published_workspace(self.output, batch, receipt)
+        self.assertTrue(batch.exists())
         loaded = load_task(path)
         run_task(loaded, FakeAPI(), allow_missing=True)
         self.assertEqual(loaded["state"], "complete")

@@ -10,7 +10,8 @@ from pathlib import Path
 from queue import Empty, Queue
 import sys
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Thread, Event
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -21,7 +22,8 @@ from .import_rules import require_version
 from .backgrounds import normalize_pairs, pair_lookup
 from .diagnostics import summarize
 from .field_help import FIELD_HELP
-from .workspaces import load_workspace
+from .workspaces import load_workspace, workspace_settings
+from .workspace_session import entries as session_entries, load_session, remember
 from .bundle_versions import latest_record, read_history, resolve_bundle_versions, validate_version
 from .settings import (
     default_config_path, default_settings, effective_settings, load_settings,
@@ -87,6 +89,9 @@ class UploaderApp:
     def __init__(self, root: tk.Tk, config_path: Path | None = None):
         self.root = root
         self.config_path = (config_path or default_config_path()).resolve()
+        self.session_path = self.config_path.with_suffix(".workspaces.json")
+        self._new_batch_ack = False
+        self.startup_poll_id = None
         self.settings = default_settings()
         self.result = None
         self.result_signature = None
@@ -105,6 +110,8 @@ class UploaderApp:
         self.help_window = None
         self.help_text = None
         self.workspace_manager = None
+        self.prepared_batch = None
+        self.host_key_requests = []
         self.error_on_load = None
         if self.config_path.is_file():
             try:
@@ -129,6 +136,67 @@ class UploaderApp:
             self._set_details("配置读取失败", [self.error_on_load])
             self.status.set("配置未载入，请在配置页检查文件。")
             self.pages.select(self.config_page)
+        elif self.workspace_entries():
+            self.startup_poll_id = self.root.after(300, self.offer_resume)
+
+    def workspace_entries(self):
+        raw = self.variables[("local", "release_root")].get().strip()
+        current = Path(raw).expanduser() if raw else None
+        if current and not current.is_absolute():
+            current = self.config_path.parent / current
+        return session_entries(self.session_path, current)
+
+    def remember_workspace(self, batch=None):
+        root = Path(batch).parent if batch else Path(self.variables[("local", "release_root")].get()).resolve()
+        remember(self.session_path, root, batch)
+
+    def offer_resume(self):
+        if self.startup_poll_id:
+            self.root.after_cancel(self.startup_poll_id)
+        self.startup_poll_id = None
+        if self.closed or self.busy or self.root.state() == "withdrawn":
+            return
+        rows = [r for r in self.workspace_entries() if r["managed"]]
+        if not rows:
+            return
+        active = load_session(self.session_path)["active"]
+        preferred = next((r for r in rows if r["path"] == active), rows[-1])
+        choice = messagebox.askyesnocancel("发现未提交的工作区", f"还有 {len(rows)} 个未提交工作区。\n\n" +
+            preferred["name"] + "\n" + preferred["state"] + "\n\n是：继续这个工作区并恢复其服务器配置。"
+            "\n否：打开工作区列表选择。\n取消：暂时保留当前页面。", parent=self.root)
+        if choice is True:
+            self.resume_workspace(Path(preferred["path"]))
+        elif choice is False:
+            self.manage_workspaces()
+
+    def choose_directory_with_pending(self, selected):
+        rows = [r for r in self.workspace_entries() if r["managed"]]
+        if not rows:
+            return True
+        if self.prepared_batch:
+            from .publishing import load_preparation
+            try:
+                record = load_preparation(self.prepared_batch.parent, self.prepared_batch)
+                can_append = not record.get("build") and record.get("state") != "building"
+            except (ValueError, OSError):
+                can_append = False
+            text = ("已有未提交工作区：" + self.prepared_batch.name + "\n\n" +
+                    ("是：把新目录追加到当前工作区。" if can_append else "是：继续当前工作区完成后续步骤。") +
+                    "\n否：保留旧工作区，新建独立工作区（例如另一台 server）。\n取消：保持原目录。")
+        else:
+            can_append = False
+            text = f"已有 {len(rows)} 个未提交工作区。\n\n是：打开列表继续已有工作区。"
+            text += "\n否：保留已有内容，明确新建独立工作区。\n取消：保持原目录。"
+        choice = messagebox.askyesnocancel("选择目录前确认工作区", text, parent=self.root)
+        if choice is True:
+            if can_append:
+                return True
+            if self.prepared_batch:
+                self.resume_workspace(self.prepared_batch)
+            else:
+                self.manage_workspaces()
+            return False
+        return self.new_batch(confirmed=True) if choice is False else False
 
     def _style(self):
         self.scale = max(1.0, self.root.winfo_fpixels("1i") / 96)
@@ -159,8 +227,30 @@ class UploaderApp:
         self.style.map("Accent.TButton", background=[("disabled", "#cbd5e1"), ("active", "#1d4ed8")],
                        foreground=[("disabled", "#64748b"), ("!disabled", "#ffffff")])
         self.style.configure("TNotebook", borderwidth=0)
-        self.style.configure("TNotebook.Tab", padding=(self.px(18), self.px(7)))
-        self.style.map("TNotebook.Tab", background=[("selected", "#ffffff")])
+        # Both Clam's element and its selected-padding map change tab geometry.
+        # Flat images and explicit state padding keep the outline and label fixed.
+        self.tab_images = []
+        for fill, border in (("#f3f5f8", "#cbd5e1"), ("#dbeafe", "#93c5fd"), ("#e2e8f0", "#cbd5e1")):
+            tab_image = tk.PhotoImage(master=self.root, width=3, height=3)
+            tab_image.put(border, to=(0, 0, 3, 3))
+            tab_image.put(fill, to=(1, 1, 2, 2))
+            self.tab_images.append(tab_image)
+        self.style.element_create("Uploader.tab", "image", self.tab_images[0],
+            ("selected", self.tab_images[1]), ("active", self.tab_images[2]), border=1, sticky="nsew")
+        self.style.layout("TNotebook.Tab", [("Uploader.tab", {"sticky": "nswe", "children": [
+            ("Notebook.padding", {"sticky": "nswe", "children": [
+                ("Notebook.focus", {"sticky": "nswe", "children": [
+                    ("Notebook.label", {"sticky": "nswe"})]})]})]})])
+        self.style.configure("TNotebook.Tab", padding=(self.px(18), self.px(7)),
+                             relief="flat", borderwidth=1)
+        self.style.map("TNotebook.Tab", background=[("selected", "#dbeafe"), ("active", "#e2e8f0"), ("!selected", "#f3f5f8")],
+                       padding=[("selected", (self.px(18), self.px(7))), ("!selected", (self.px(18), self.px(7)))],
+                       foreground=[("selected", "#1d4ed8"), ("!selected", "#475569")],
+                       lightcolor=[("selected", "#93c5fd"), ("!selected", "#cbd5e1")],
+                       darkcolor=[("selected", "#93c5fd"), ("!selected", "#cbd5e1")],
+                       bordercolor=[("selected", "#93c5fd"), ("!selected", "#cbd5e1")],
+                       relief=[("selected", "flat"), ("!selected", "flat")],
+                       expand=[("selected", (0, 0, 0, 0)), ("!selected", (0, 0, 0, 0))])
         self.style.configure("Treeview", rowheight=self.px(28), background="#ffffff", fieldbackground="#ffffff")
         self.style.configure("Treeview.Heading", padding=self.px(5), font=("Microsoft YaHei UI", 9, "bold"))
         self.style.configure("TEntry", padding=self.px(5), fieldbackground="#ffffff")
@@ -185,7 +275,7 @@ class UploaderApp:
         self.config_page = ttk.Frame(self.pages, padding=(self.px(16), self.px(14)))
         self.pages.add(self.home_page, text="更新")
         self.pages.add(self.config_page, text="配置")
-        self.status = tk.StringVar(value="01/02 待接入 · 预处理、检查与可选 03 已可用 · ⓘ 查看说明。")
+        self.status = tk.StringVar(value="01 准备 → 审核保存 songlist → 02 上传 → 03 确认提交；API 操作按需选择。")
         self._home()
         self._config()
         footer = ttk.Frame(shell)
@@ -198,7 +288,7 @@ class UploaderApp:
         heading.pack(fill="x")
         ttk.Label(heading, text="本次更新", style="Section.TLabel").pack(side="left")
         self._help_button(heading, "workflow", "stages").pack(side="left", padx=(4, 8))
-        ttk.Label(heading, text="01 → 保存审核结果 → 02 → 可选 03", style="Muted.TLabel").pack(side="left")
+        ttk.Label(heading, text="01 → 保存审核结果 → 02 → 03 确认提交", style="Muted.TLabel").pack(side="left")
         directory = ttk.Frame(page)
         directory.pack(fill="x", pady=(6, 10))
         self.input_var = tk.StringVar()
@@ -218,7 +308,7 @@ class UploaderApp:
         self.import_version_var = tk.StringVar()
         self.variables[("import", "version")] = self.import_version_var
         ttk.Entry(version_row, textvariable=self.import_version_var, width=18).pack(side="left", padx=8)
-        ttk.Label(version_row, text="覆盖本次曲目及各难度的 version", style="Muted.TLabel").pack(side="left")
+        ttk.Label(version_row, text="覆盖本次曲目顶层的 version", style="Muted.TLabel").pack(side="left")
         app_row = ttk.Frame(page)
         app_row.pack(fill="x", pady=(0, 10))
         self.follow_app_version_var = tk.BooleanVar(value=True)
@@ -241,7 +331,7 @@ class UploaderApp:
         for column, title, detail, button in (
             (0, "01  准备与审核", "自动预处理、检查并准备资源，打开 songlist 审核。", "准备并审核"),
             (1, "02  打包与上传", "打包并同步本地、VPS；完成文件核验。", "打包并上传"),
-            (2, "03  服务端操作", "刷新资源、补购买项和定数；可选执行。", "服务端操作"),
+            (2, "03  服务端与提交", "按需刷新、补购买和定数；验收提交后清理工作区。", "服务端与提交"),
         ):
             card = ttk.Frame(stages, style="Card.TFrame", padding=self.px(12))
             card.grid(row=0, column=column, sticky="nsew", padx=(0, 5) if column == 0 else (5, 0))
@@ -252,10 +342,10 @@ class UploaderApp:
                 wraplength=max(self.px(40), event.width - self.px(24))))
             row = ttk.Frame(card, style="Card.TFrame")
             row.pack(side="bottom", fill="x")
-            action = ttk.Button(row, text=button, state="disabled" if column < 2 else "normal",
-                                command=(lambda: self.results.select(self.server_ops.frame)) if column == 2 else None)
+            action = ttk.Button(row, text=button, command=(self.start_prepare if column == 0 else
+                self.start_publish if column == 1 else lambda: self.results.select(self.server_ops.frame)))
             action.pack(side="left")
-            ttk.Label(row, text="待接入" if column < 2 else "可选", style="CardMuted.TLabel").pack(side="left", padx=6)
+            ttk.Label(row, text="审核后执行" if column == 1 else "API 可选" if column == 2 else "", style="CardMuted.TLabel").pack(side="left", padx=6)
             self.stage_buttons.append(action)
         self.summary = tk.StringVar(value="辅助操作：预处理曲目 / 检查资源 · 原始目录保持不变")
         ttk.Label(page, textvariable=self.summary, style="Section.TLabel").pack(anchor="w", pady=(0, 6))
@@ -268,6 +358,8 @@ class UploaderApp:
         self.export_button.pack(side="left")
         self.workspace_button = ttk.Button(toolbar, text="工作区管理…", command=self.manage_workspaces)
         self.workspace_button.pack(side="left", padx=8)
+        self.new_batch_button = ttk.Button(toolbar, text="新建批次…", command=self.new_batch)
+        self.new_batch_button.pack(side="left")
         ttk.Button(toolbar, text="打开配置页", command=lambda: self.pages.select(self.config_page)).pack(side="right")
         self.results = ttk.Notebook(page)
         self.results.pack(fill="both", expand=True)
@@ -289,8 +381,8 @@ class UploaderApp:
         from .server_tasks_gui import ServerOperationsPanel
         self.server_ops = ServerOperationsPanel(self)
         self._set_details("检查结果", [
-            "预处理和检查是可单独运行的辅助操作；当前预览版尚未接入 01、02。",
-            "接入后可直接执行 01，内部自动预处理、检查并准备资源。审核保存工作区 songlist 后，再执行 02。",
+            "可直接执行 01，内部自动预处理、检查并准备资源；预处理和检查按钮是辅助入口。",
+            "审核保存工作区 songlist 后执行 02；新增曲包和解锁条件须手动补充 packlist / unlocks。",
             "03 可选执行：刷新资源、购买项、人工定数和成绩评分；也支持已手动上传的批次。",
         ])
 
@@ -492,6 +584,9 @@ class UploaderApp:
         else:
             selected = filedialog.askopenfilename(parent=self.root, initialdir=str(initial), title="选择文件")
         if selected:
+            if section == "local" and key == "input_root" and selected != self.input_var.get():
+                if not self.choose_directory_with_pending(selected):
+                    return
             self.variables[(section, key)].set(selected)
 
     def save(self):
@@ -541,6 +636,114 @@ class UploaderApp:
     def start_preprocess(self):
         self._start_job("preprocess")
 
+    def start_prepare(self):
+        if self.busy or not self.server_ops.commit_editor():
+            return
+        resume = None
+        if self.prepared_batch:
+            try:
+                from .publishing import load_preparation
+                values = self._collect()
+                record = load_preparation(self.prepared_batch.parent, self.prepared_batch)
+                if record.get("build") or record.get("state") == "building":
+                    raise ValueError("该批次已开始打包，请继续 02，或点击“新建批次”。")
+                if not messagebox.askyesno("追加到当前待发布批次", "当前批次：" + self.prepared_batch.name +
+                    f"\n已准备 {len(record.get('ids', []))} 首曲目。\n\n请先保存并关闭正在编辑的 songlist。"
+                    "本次将以已保存的总表为基础合入新曲目，保留已有资源；冲突保留已有值并报告。"
+                    "\n\n继续追加？完成后将重新打开同一路径的总表。", parent=self.root, default="no"):
+                    return
+                if self.server_ops.task and self.server_ops.task["id"] == self.prepared_batch.name:
+                    if not self.server_ops.save():
+                        return
+                resume = self.prepared_batch
+            except (ValueError, OSError) as error:
+                messagebox.showerror("无法追加 01", str(error), parent=self.root)
+                return
+        elif (self.preprocessed and
+                self.preprocessed_signature == json.dumps(self._collect(), sort_keys=True)):
+            resume = self.preprocessed.get("batch_root")
+        if not resume and not self._new_batch_ack and any(r["managed"] for r in self.workspace_entries()):
+            choice = messagebox.askyesnocancel("已有未提交工作区", "是：打开列表继续已有工作区。"
+                "\n否：保留已有内容并新建独立工作区。\n取消：不开始本次准备。", parent=self.root)
+            if choice is True:
+                self.manage_workspaces()
+                return
+            if choice is not False:
+                return
+        self._new_batch_ack = False
+        self._start_job("prepare", resume_from=resume)
+
+    def new_batch(self, confirmed=False):
+        if self.busy or not self.server_ops.commit_editor():
+            return False
+        if not confirmed and any(r["managed"] for r in self.workspace_entries()):
+            if not messagebox.askyesno("新建独立批次", "还有未提交的工作区，原有内容将完整保留。"
+                "\n\n确认从新目录开始独立工作区（例如另一台 server）？", parent=self.root, default="no"):
+                return False
+        if self.server_ops.task and not self.server_ops.save():
+            return False
+        self._new_batch_ack = True
+        self.prepared_batch = None
+        self.remember_workspace()
+        self.preprocessed = self.preprocessed_signature = None
+        self.result = self.result_signature = None
+        self.server_ops.task = self.server_ops.path = None
+        self.server_ops.context_expired = False
+        self.server_ops.render()
+        self.server_ops.hint.set("新批次：执行 01 后填写定数。")
+        for tree in (self.song_tree, self.file_tree):
+            tree.delete(*tree.get_children())
+        self.export_button.configure(state="disabled")
+        self.summary.set("新批次 · 选择目录与 version 后执行 01")
+        self.status.set("原待发布批次保留；下一次 01 创建独立工作区。")
+        return True
+
+    def start_publish(self):
+        if self.busy or not self.server_ops.commit_editor():
+            return
+        if not self.prepared_batch:
+            messagebox.showinfo("先完成 01", "请先执行“准备并审核”，或在工作区管理中继续已准备的批次。", parent=self.root)
+            return
+        try:
+            values = self._collect()
+            from .publishing import load_preparation
+            from .ssh_upload import remote_database
+            record = load_preparation(values["local"]["release_root"], self.prepared_batch)
+            remote = remote_database(values)
+            songlist = Path(self.prepared_batch) / "prepared/active/songs/songlist"
+            text = ("确认已审核并保存以下 songlist：\n" + str(songlist) +
+                    "\n\n请同时确认新增曲包 / 解锁条件已手动写入 packlist、unlocks 并保存。" +
+                    "\n\n将安装至本地服务端，再通过 SSH 上传至：\n" + values["ssh"]["host"] + ":" + remote +
+                    "\n\n02 完成后保留工作区；刷新、购买和定数 API 在 03 按需执行，最后确认提交。")
+            if record.get("build"):
+                text += "\n\n继续已有构建 " + record["build"]["version"] + "，不会生成新版本。"
+            if not messagebox.askyesno("确认执行 02", text, parent=self.root, default="no"):
+                return
+            if self.server_ops.task and self.server_ops.task["id"] == Path(self.prepared_batch).name:
+                self.server_ops.save()
+        except (ValueError, OSError) as error:
+            messagebox.showerror("无法开始 02", str(error), parent=self.root)
+            return
+        self._start_job("publish", resume_from=self.prepared_batch)
+
+    @staticmethod
+    def open_review(path):
+        if os.name == "nt":
+            subprocess.Popen(["notepad.exe", str(path)], creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _confirm_host_key(self, hostname, algorithm, fingerprint):
+        request = {"hostname": hostname, "algorithm": algorithm, "fingerprint": fingerprint,
+                   "event": Event(), "accepted": False}
+        self.host_key_requests.append(request)
+        self.queue.put(("hostkey", request))
+        while not request["event"].wait(0.2):
+            if self.closed:
+                return False
+        return request["accepted"]
+
     def _start_job(self, kind, resume_from=None):
         if self.busy:
             return
@@ -560,20 +763,30 @@ class UploaderApp:
         self._refresh_bundle_preview()
         self.busy = True
         self.job_kind = kind
+        if kind == "prepare":
+            self.server_ops.context_expired = True
+        if kind in {"prepare", "preprocess", "publish"}:
+            remember(self.session_path, values["local"]["release_root"], self.prepared_batch)
         if kind == "preprocess":
             self.preprocessed = None
             self.preprocessed_signature = None
+        if kind == "prepare" and not resume_from:
+            self.prepared_batch = None
         self.result = None
         self.result_signature = json.dumps(values, sort_keys=True)
         self.check_button.configure(state="disabled")
         self.preprocess_button.configure(state="disabled")
         self.workspace_button.configure(state="disabled")
+        self.new_batch_button.configure(state="disabled")
+        for button in self.stage_buttons:
+            button.configure(state="disabled")
         self.export_button.configure(state="disabled")
         for tree in (self.song_tree, self.file_tree):
             tree.delete(*tree.get_children())
-        self._set_details("正在检查", ["正在扫描本次曲目和比较资源，请稍候。"])
+        self._set_details("正在执行 " + kind, ["进度和诊断会显示在此处；失败批次会保留供继续。"])
         self.results.select(2)
-        self.summary.set("正在整理曲目、生成标准副本…" if kind == "preprocess" else "正在扫描曲目和比较资源…")
+        self.summary.set({"prepare": "01 · 正在准备审核资源…", "publish": "02 · 正在打包、核验并上传…"}.get(kind,
+            "正在整理曲目、生成标准副本…" if kind == "preprocess" else "正在扫描曲目和比较资源…"))
         self.status.set("正在预处理，原始文件保留。" if kind == "preprocess" else "正在检查资源，窗口可继续操作。")
         self.progress.start(12)
         origin = self.config_path.parent
@@ -587,6 +800,14 @@ class UploaderApp:
             if kind == "preprocess":
                 result = preprocess_settings(values, origin, resume_from=resume_from,
                                              on_diagnostic=lambda entry: self.queue.put(("log", entry)))
+            elif kind in {"prepare", "publish"}:
+                from .publishing import prepare_update, publish_update
+                callback = lambda entry: self.queue.put(("log", entry))
+                if kind == "prepare":
+                    result = prepare_update(values, origin, resume_from=resume_from, on_diagnostic=callback)
+                else:
+                    result = publish_update(values, origin, resume_from, on_diagnostic=callback,
+                                            on_host_key=self._confirm_host_key)
             else:
                 result = inspect_settings(values, origin, previous)
                 for entry in result.get("diagnostics", []):
@@ -605,6 +826,13 @@ class UploaderApp:
             except Empty:
                 self.poll_id = self.root.after(80, self._poll)
                 return
+            if success == "hostkey":
+                value["accepted"] = messagebox.askyesno("首次连接 SSH 主机", "请核对服务器主机指纹：\n\n" +
+                    value["hostname"] + "\n" + value["algorithm"] + "\n" + value["fingerprint"] +
+                    "\n\n确认后保存至配置的 known_hosts，再继续上传。", parent=self.root, default="no")
+                value["event"].set()
+                self.host_key_requests.remove(value)
+                continue
             if success != "log":
                 break
             self._append_log(value)
@@ -616,9 +844,13 @@ class UploaderApp:
         self.check_button.configure(state="normal")
         self.preprocess_button.configure(state="normal")
         self.workspace_button.configure(state="normal")
+        self.new_batch_button.configure(state="normal")
+        for button in self.stage_buttons:
+            button.configure(state="normal")
         if not success:
-            self.summary.set("检查未完成 · 请查看待处理与提示")
-            self._set_details("检查未完成", [])
+            self.summary.set(("02 未完成 · 保留原批次供重试" if self.job_kind == "publish" else
+                              "01 未完成 · 请查看 ERROR" if self.job_kind == "prepare" else
+                              "检查未完成 · 请查看待处理与提示"))
             self._append_log({"level": "error", "code": "job.failed", "message": value, "song_id": None})
             self.results.select(2)
             self.status.set("请检查路径和资源后重试。")
@@ -628,8 +860,35 @@ class UploaderApp:
             self.preprocessed = value
             self.preprocessed_signature = self.result_signature
             self._show_preprocess(value)
+        elif self.job_kind == "publish":
+            from .server_tasks import load_task
+            self.prepared_batch = Path(value["batch_root"])
+            self.remember_workspace(self.prepared_batch)
+            self.preprocessed = self.preprocessed_signature = None
+            self.server_ops.task = load_task(value["server_task_file"])
+            self.server_ops.path = Path(value["server_task_file"])
+            self.server_ops.context_signature = None
+            self.server_ops.context_expired = False
+            self.server_ops.render()
+            self.summary.set("02 已上传 · bundle " + value["version"] + " · 工作区尚未提交")
+            self.status.set("工作区完整保留。请完成 03，确认结果后提交并清理。")
+            self.export_button.configure(state="normal")
         else:
             self._show_result(value)
+            if self.job_kind == "prepare" and value.get("review_songlist"):
+                self.prepared_batch = Path(value["batch_root"])
+                self.remember_workspace(self.prepared_batch)
+                self.status.set(f"批次 {self.prepared_batch.name} · 累计 {len(value['songs'])} 首。"
+                    "可选择目录继续追加 01；审核保存后执行 02。")
+                from .server_tasks import read_reviewed
+                if self.server_ops.task:
+                    self.server_ops.task = read_reviewed(self.server_ops.task, value["review_songlist"])
+                self.server_ops.render()
+                try:
+                    self.open_review(value["review_songlist"])
+                except OSError as error:
+                    self._append_log({"level": "warning", "message": "无法启动编辑器，请手动打开：" +
+                        value["review_songlist"] + " · " + str(error), "song_id": None})
         try:
             current = json.dumps(self._collect(), sort_keys=True)
         except (ValueError, OSError):
@@ -648,13 +907,54 @@ class UploaderApp:
         self.workspace_manager = WorkspaceManager(self)
 
     def resume_workspace(self, batch):
-        if self.busy:
+        if self.busy or not self.server_ops.commit_editor():
             return
         try:
-            values = self._collect()
-            report = load_workspace(values["local"]["release_root"], batch)
+            batch = Path(batch).resolve()
+            if self.server_ops.task and not self.server_ops.save():
+                return
+            values = workspace_settings(batch.parent, batch, self._collect(), self.config_path.parent)
+            self._fill(values)
+            self.remember_workspace(batch)
+            report = load_workspace(batch.parent, batch)
             self.input_var.set(report["input_root"])
             self.import_version_var.set(report["import_version"])
+            if (Path(batch) / "publish.json").is_file():
+                from .publishing import load_preparation
+                from .planner import read_json
+                journal = Path(batch) / "append-transaction.json"
+                record = (read_json(Path(batch) / "publish.json") if journal.exists() else
+                          load_preparation(batch.parent, batch))
+                self.follow_app_version_var.set(record["binding"]["bundle"]["follow_app_version"])
+                self.manual_app_version_var.set(record["binding"]["bundle"]["app_version"])
+                if record.get("pending_append") or journal.exists():
+                    self.prepared_batch = Path(batch)
+                    self.input_var.set((record.get("pending_append") or {}).get("input_root", record["binding"]["local"]["input_root"]))
+                    self._start_job("prepare", resume_from=batch)
+                    return
+                if record.get("state") in {"preparing", "blocked"}:
+                    self._start_job("prepare", resume_from=batch)
+                    return
+                self.prepared_batch = Path(batch)
+                self.result = read_json(Path(batch) / "plan.json")
+                self._show_result(self.result)
+                from .server_tasks import existing_task_path, load_task, read_reviewed, task_path
+                if record.get("state") in {"awaiting_stage03", "committed_cleanup_pending"}:
+                    self.server_ops.path = task_path(batch.parent, batch.name, create=False)
+                    self.server_ops.task = load_task(self.server_ops.path)
+                    self.server_ops.context_signature = None
+                    self.server_ops.context_expired = False
+                    self.server_ops.render()
+                    self.results.select(self.server_ops.frame)
+                    self.status.set("已恢复服务器配置与 03 进度；工作区等待最终提交。")
+                    self.pages.select(self.home_page)
+                    return
+                self.server_ops.task = read_reviewed(self.server_ops.task, Path(batch) / "prepared/active/songs/songlist")
+                self.server_ops.render()
+                self.pages.select(self.home_page)
+                self.status.set("已载入待发布批次，可继续审核或执行 02；修复原始包后需重新执行 01。")
+                self.open_review(Path(batch) / "prepared/active/songs/songlist")
+                return
         except (ValueError, OSError, KeyError) as exc:
             messagebox.showerror("无法继续批次", str(exc), parent=self.root)
             return
@@ -672,6 +972,13 @@ class UploaderApp:
         self.pages.select(self.home_page)
 
     def forget_workspace(self, batch):
+        if self.server_ops.task and self.server_ops.task["id"] == batch.name:
+            self.server_ops.cancel_editor()
+            self.server_ops.task = self.server_ops.path = None
+            self.server_ops.render()
+        if self.prepared_batch == batch:
+            self.prepared_batch = None
+            self.remember_workspace()
         references = [self.preprocessed or {}, self.result or {}]
         if not any(r.get("batch_root") == str(batch) or r.get("preprocessing_report") == str(batch / "report.json")
                    for r in references):
@@ -683,6 +990,16 @@ class UploaderApp:
             tree.delete(*tree.get_children())
         self.summary.set("批次已清理 · 请重新预处理或检查")
         self._set_details("工作区已清理", [str(batch)])
+
+    def workspace_committed(self, batch, history):
+        self.prepared_batch = None
+        self.preprocessed = self.preprocessed_signature = None
+        self.result = {"mode": "committed", "batch_id": batch.name, "history_file": str(history)}
+        self.remember_workspace()
+        self.summary.set("工作区已提交 · 临时内容已清理")
+        self.status.set("保留完成摘要与 03 任务归档；可以开始新的工作区。")
+        if self.workspace_manager:
+            self.workspace_manager.refresh()
 
     def _set_details(self, title, lines):
         self.log_items = []
@@ -723,7 +1040,7 @@ class UploaderApp:
         self._render_diagnostics(plan, "资源检查结果")
         self.export_button.configure(state="normal")
         self.results.select(2 if plan["errors"] or plan.get("warnings") else 0)
-        self.status.set("预检完成，查看 ERROR。" if plan["errors"] else "预检完成，请审核 WARNING；当前未执行发布。")
+        self.status.set("资源检查完成，查看 ERROR。" if plan["errors"] else "资源检查完成，请审核 WARNING；尚未上传。")
         self.server_ops.set_context(plan)
 
     def _show_preprocess(self, report):
@@ -838,10 +1155,24 @@ class UploaderApp:
         text.configure(state="disabled")
 
     def close(self):
+        if self.closed:
+            return
+        if self.busy and not messagebox.askyesno("任务正在执行", "关闭窗口会中断任务。已完成的步骤将保留，但突然中断 SSH 可能需要核对远端上传锁。仍要关闭？",
+                                                   parent=self.root, default="no"):
+            return
+        if not self.busy and self.server_ops.task:
+            if not self.server_ops.commit_editor() or not self.server_ops.save():
+                return
         self.closed = True
+        if self.workspace_manager:
+            self.workspace_manager.close()
+        for request in self.host_key_requests:
+            request["event"].set()
         self.server_ops.close()
         if self.poll_id:
             self.root.after_cancel(self.poll_id)
+        if self.startup_poll_id:
+            self.root.after_cancel(self.startup_poll_id)
         self.root.destroy()
 
 

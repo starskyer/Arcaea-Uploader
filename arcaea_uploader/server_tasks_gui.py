@@ -10,9 +10,10 @@ from tkinter import filedialog, messagebox, ttk
 from .api_client import ApiClient
 from .import_rules import actual_chart_classes
 from .planner import PlanError, digest
-from .server_tasks import (OPTIONS, confirm_uploaded, english_name, fingerprint, load_task,
+from .server_tasks import (OPTIONS, confirm_uploaded, english_name, existing_task_path, fingerprint, finish_task, load_task,
     make_task, missing_constants, parse_constant, purchase_specs, read_reviewed, run_task,
-    save_task, task_lock, task_path)
+    save_task, task_complete, task_lock, task_path)
+from .workspaces import (bind_workspace_api, commit_workspace, verify_workspace_api, verify_workspace_publication, workspace_lock)
 
 
 class ServerOperationsPanel:
@@ -29,9 +30,11 @@ class ServerOperationsPanel:
         for label, command in (("审核总表…", self.choose_source), ("选项…", self.options),
                                ("保存定数", self.save), ("载入任务…", self.open_task)):
             ttk.Button(toolbar, text=label, command=command).pack(side="left", padx=(0, 4))
+        self.commit_button = ttk.Button(toolbar, text="提交并清理…", command=self.commit, state="disabled")
+        self.commit_button.pack(side="right")
         self.execute_button = ttk.Button(toolbar, text="执行 03…", style="Accent.TButton", command=self.execute)
         self.execute_button.pack(side="right")
-        self.hint = tk.StringVar(value="先预处理或检查本批曲目；定数双击填写，空难度固定 -1。03 可跳过。")
+        self.hint = tk.StringVar(value="定数双击填写，空难度固定 -1；03 操作可选，成功后确认提交再清理工作区。")
         hint_label = ttk.Label(self.frame, textvariable=self.hint, style="Muted.TLabel", wraplength=app.px(760))
         hint_label.pack(anchor="w", padx=8, pady=(0, 3))
         self.frame.bind("<Configure>", lambda event: hint_label.configure(
@@ -64,9 +67,11 @@ class ServerOperationsPanel:
                 actual = {p["id"]: actual_chart_classes(Path(p["output"]), database / p["id"]) for p in packages}
             else:
                 rows = report["merged_songlist"]
-                actual = {}
+                actual = deepcopy(report.get("actual", {}))
                 for song in report["songs"]:
                     sid = song["id"]
+                    if sid in actual:
+                        continue
                     folders = {Path(f["source"]).parent for f in report["files"]
                                if f["area"] == "database" and f["path"].startswith("songs/" + sid + "/")
                                and f["path"].endswith(".aff") and not f["placeholder"]}
@@ -75,8 +80,9 @@ class ServerOperationsPanel:
                                                   if report.get("preprocessing_report") else None)
             task_id = Path(batch).name if batch else "plan-" + fingerprint(
                 [local["input_root"], settings["import"]["version"], sorted(actual)])[:16]
-            self.path = Path(local["release_root"]) / ".server-tasks" / (task_id + ".json")
-            previous = load_task(self.path) if self.path.is_file() else None
+            self.path = task_path(local["release_root"], task_id, create=False)
+            prior = existing_task_path(local["release_root"], task_id)
+            previous = load_task(prior) if prior.is_file() else None
             self.task = make_task(task_id, rows, actual, previous)
             self.task["input_errors"] = report.get("errors", []).copy()
             self.context_signature = self.binding(settings)
@@ -94,6 +100,7 @@ class ServerOperationsPanel:
 
     def render(self):
         self.tree.delete(*self.tree.get_children())
+        self.commit_button.configure(state="disabled")
         if not self.task:
             return
         for row in self.task["songs"]:
@@ -105,7 +112,10 @@ class ServerOperationsPanel:
             self.tree.insert("", "end", iid=sid, values=values)
         source = (self.task.get("source") or {}).get("path")
         self.hint.set(("审核表：" + Path(source).name if source else "尚未选择最终审核总表") +
-                      f" · 未填 {len(missing_constants(self.task))} 项 · 双击录入；空难度 -1。")
+                      f" · 未填 {len(missing_constants(self.task))} 项 · 购买候选 {len(self.task.get('purchase_candidates', []))} 项" +
+                      (" · 03 完成，待确认提交。" if task_complete(self.task) else " · 双击录入；空难度 -1。"))
+        if self.path and self.path.name == "server-task.json" and task_complete(self.task) and not self.app.busy:
+            self.commit_button.configure(state="normal")
 
     def save(self):
         if self.app.busy or not self.task or not self.commit_editor():
@@ -178,6 +188,8 @@ class ServerOperationsPanel:
                                               filetypes=[("Songlist", "*")])
         if selected:
             try:
+                if self.path and self.path.name == "server-task.json" and (self.path.parent / "receipt.json").is_file():
+                    raise PlanError("02 已固定本工作区的审核总表；更正资源需另建工作区，不能替换已上传的总表。")
                 updated = read_reviewed(self.task, selected)
                 self.task = updated
                 self.save()
@@ -192,6 +204,10 @@ class ServerOperationsPanel:
                                               filetypes=[("03 任务", "*.json")])
         if selected:
             try:
+                if Path(selected).name == "server-task.json" and (Path(selected).parent / "publish.json").is_file():
+                    self.app.resume_workspace(Path(selected).parent)
+                    self.app.results.select(self.frame)
+                    return
                 self.task, self.path = load_task(selected), Path(selected).resolve()
                 self.context_signature, self.context_expired = None, False
                 self.render()
@@ -232,6 +248,8 @@ class ServerOperationsPanel:
         try:
             if self.task.get("input_errors"):
                 raise PlanError("原批次仍有 ERROR，请修复并重新检查后再执行 03。")
+            if self.path and self.path.name == "server-task.json":
+                verify_workspace_publication(self.path.parent.parent, self.path.parent, self.task)
             if not self.task.get("source"):
                 self.choose_source()
                 if not self.task.get("source"):
@@ -245,6 +263,10 @@ class ServerOperationsPanel:
             settings = self.app._collect()
             if self.context_expired or self.context_signature and self.binding(settings) != self.context_signature:
                 raise PlanError("曲目来源或资源配置已改变，请重新检查后再执行 03。")
+            if self.path.name == "server-task.json":
+                verify_workspace_publication(self.path.parent.parent, self.path.parent, self.task)
+                if any(self.task["options"].values()):
+                    verify_workspace_api(self.path.parent.parent, self.path.parent, settings)
             specs = purchase_specs(self.task) if self.task["options"]["purchases"] else []
             missing = missing_constants(self.task)
             details = ["将调用：" + settings["api"]["base_url"],
@@ -264,6 +286,8 @@ class ServerOperationsPanel:
                 confirm_uploaded(self.task)
             if not self.save():
                 return
+            if self.path.name == "server-task.json" and any(self.task["options"].values()):
+                bind_workspace_api(self.path.parent.parent, self.path.parent, settings)
             self.set_busy(True)
             self.app._set_details("03 服务端操作", [str(self.path)])
             self.app.results.select(2)
@@ -274,28 +298,86 @@ class ServerOperationsPanel:
 
     def set_busy(self, busy):
         self.app.busy = busy
-        for button in (self.app.check_button, self.app.preprocess_button, self.app.workspace_button, self.execute_button):
+        for button in (self.app.check_button, self.app.preprocess_button, self.app.workspace_button, self.app.new_batch_button, self.execute_button):
+            button.configure(state="disabled" if busy else "normal")
+        for button in self.app.stage_buttons:
             button.configure(state="disabled" if busy else "normal")
         if busy:
             self.app.progress.start(12)
             self.app.status.set("03 正在执行；每一步完成后保存进度。")
         else:
             self.app.progress.stop()
+        if busy:
+            self.commit_button.configure(state="disabled")
+        elif self.task:
+            self.render()
 
     def worker(self, settings, path):
         task = None
         try:
-            with task_lock(path):
-                task = load_task(path)
-                if not any(task["options"].values()):
-                    task["state"] = "skipped"
-                    save_task(path, task, locked=True)
-                else:
-                    run_task(task, ApiClient.from_settings(settings), persist=lambda task: save_task(path, task, locked=True),
-                             on_log=lambda level, message: self.queue.put(("log", (level, message))), allow_missing=True)
+            if path.name == "server-task.json":
+                with workspace_lock(path.parent.parent, path.parent):
+                    task = self.run_locked(settings, path)
+            else:
+                task = self.run_locked(settings, path)
             self.queue.put(("done", (task, None)))
         except Exception as error:
+            try:
+                task = load_task(path)
+            except (OSError, ValueError):
+                pass
             self.queue.put(("done", (task, str(error))))
+
+    def run_locked(self, settings, path):
+        with task_lock(path):
+            task = load_task(path)
+            if path.name == "server-task.json":
+                verify_workspace_publication(path.parent.parent, path.parent, task)
+                if any(task["options"].values()):
+                    verify_workspace_api(path.parent.parent, path.parent, settings)
+            if not any(task["options"].values()):
+                finish_task(task, skipped=True)
+                save_task(path, task, locked=True)
+            else:
+                run_task(task, ApiClient.from_settings(settings), persist=lambda task: save_task(path, task, locked=True),
+                         on_log=lambda level, message: self.queue.put(("log", (level, message))), allow_missing=True)
+            return task
+
+    def commit(self):
+        if self.app.busy or not self.task or not self.commit_editor():
+            return
+        try:
+            if not self.path or self.path.name != "server-task.json":
+                raise PlanError("独立任务没有待提交工作区。")
+            if not self.save():
+                return
+            batch = self.path.parent
+            verify_workspace_publication(batch.parent, batch, self.task)
+            if not task_complete(self.task):
+                raise PlanError("03 仍需执行，或定数 / 选项已改变。")
+            note = "全部 API 操作已明确跳过。" if self.task["state"] == "skipped" else "本次选择的 03 操作已成功完成。"
+            omitted = [label for key, label in zip(OPTIONS, ("刷新资源", "购买项", "曲目定数", "刷新评分")) if not self.task["options"][key]]
+            if omitted:
+                note += "\n已跳过：" + "、".join(omitted) + "。"
+            if self.task.get("endpoint"):
+                note += "\n目标 API：" + self.task["endpoint"]
+            if not messagebox.askyesno("确认提交本工作区", note + "\n\n请确认本批文件、购买项和定数均符合预期。\n\n" +
+                str(batch) + "\n\n提交后清理整个临时工作区，保留完成记录与 03 任务归档。确认提交？",
+                parent=self.app.root, default="no"):
+                return
+            self.set_busy(True)
+            Thread(target=self.commit_worker, args=(batch, self.task["revision"]), daemon=True).start()
+            self.poll_id = self.app.root.after(80, self.poll)
+        except (ValueError, OSError) as error:
+            messagebox.showerror("无法提交工作区", str(error), parent=self.app.root)
+
+    def commit_worker(self, batch, revision):
+        try:
+            history = commit_workspace(batch.parent, batch, expected_revision=revision)
+            archive = batch.parent / ".server-tasks" / (batch.name + ".json")
+            self.queue.put(("committed", (batch, history, archive, None)))
+        except Exception as error:
+            self.queue.put(("committed", (batch, None, None, str(error))))
 
     def poll(self):
         self.poll_id = None
@@ -308,6 +390,16 @@ class ServerOperationsPanel:
             if kind == "log":
                 level, message = value
                 self.app._append_log({"level": level, "message": message, "song_id": None})
+            elif kind == "committed":
+                batch, history, archive, error = value
+                if not error:
+                    self.path, self.task = archive, load_task(archive)
+                    self.app.workspace_committed(batch, history)
+                self.set_busy(False)
+                if error:
+                    self.app._append_log({"level": "error", "message": error, "song_id": None})
+                    self.app.summary.set("提交未完成 · 工作区保留供继续")
+                return
             else:
                 task, error = value
                 if task:
@@ -316,8 +408,8 @@ class ServerOperationsPanel:
                 self.set_busy(False)
                 if error:
                     self.app._append_log({"level": "error", "message": error, "song_id": None})
-                self.app.summary.set("03 未完成 · 进度已保留" if error else "03 已完成 · 可后续补填定数")
-                self.app.status.set("查看 ERROR 后，可载入同一 03 任务继续。" if error else "03 操作完成。")
+                self.app.summary.set("03 未完成 · 进度与工作区保留" if error else "03 已完成 · 工作区等待确认提交")
+                self.app.status.set("查看 ERROR 后，可载入同一工作区继续。" if error else "请验收结果，确认无误后点击“提交并清理…”。")
                 return
         self.poll_id = self.app.root.after(20, self.poll)
 

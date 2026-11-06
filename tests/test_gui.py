@@ -45,7 +45,7 @@ class GuiTests(unittest.TestCase):
         (assets / "songlist").write_text('{"songs":[]}', encoding="utf-8")
         download = self.workspace / "server" / "latest version" / "database" / "songs" / "sayonarahatsukoi"
         download.mkdir(parents=True)
-        (download / "0.aff").write_text("placeholder", encoding="utf-8")
+        (download / "0.aff").write_text("AudioOffset:0\n-\ntiming(0,100.00,4.00);", encoding="utf-8")
         song = self.workspace / "incoming" / "sample"
         song.mkdir(parents=True)
         (song / "2.aff").write_text("chart", encoding="utf-8")
@@ -61,6 +61,13 @@ class GuiTests(unittest.TestCase):
             self.root.update()
             time.sleep(0.01)
         self.assertFalse(self.app.busy, "Background preflight did not finish")
+
+    def wait_for_workspace_list(self):
+        deadline = time.monotonic() + 5
+        while self.app.workspace_manager.loading and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.01)
+        self.assertFalse(self.app.workspace_manager.loading)
 
     def test_shared_input_and_settings_survive_restart(self):
         self.app.input_var.set(str(self.workspace / "新的曲目"))
@@ -189,7 +196,7 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(len(self.app.song_tree.get_children()), 1)
         self.assertGreater(len(self.app.file_tree.get_children()), 0)
         self.assertEqual(str(self.app.export_button["state"]), "normal")
-        self.assertTrue(all(str(button["state"]) == "disabled" for button in self.app.stage_buttons[:2]))
+        self.assertTrue(all(str(button["state"]) == "normal" for button in self.app.stage_buttons[:2]))
         self.assertEqual(str(self.app.stage_buttons[2]["state"]), "normal")
         report = self.workspace / "report.json"
         with patch("arcaea_uploader.gui.filedialog.asksaveasfilename", return_value=str(report)):
@@ -200,6 +207,176 @@ class GuiTests(unittest.TestCase):
         self.app.input_var.set(str(self.workspace / "different"))
         self.assertEqual(str(self.app.export_button["state"]), "disabled")
         self.assertIn("重新检查", self.app.summary.get())
+
+    def test_stage01_button_opens_review_and_stage02_installs_and_hands_off_task(self):
+        from test_preprocess import song_metadata
+        from test_publishing import MemoryUpload, preview
+        from arcaea_uploader.publishing import publish_update
+        self.make_package()
+        (self.workspace / "incoming/sample/songlist.json").write_text(json.dumps(song_metadata("sample")), encoding="utf-8")
+        for name in ("packlist", "unlocks"):
+            (self.workspace / "active/songs" / name).write_text("{}", encoding="utf-8")
+        history = [{"applicationVersionNumber": "7.0.256", "versionNumber": "7.0.256.4"}]
+        (self.workspace / "active/metadata.oldjson").write_text(json.dumps(history), encoding="utf-8")
+        self.app.variables[("ssh", "host")].set("example.test")
+        self.app.variables[("ssh", "username")].set("ubuntu")
+        self.app.variables[("ssh", "server_project_root")].set("/srv/server")
+        with patch("arcaea_uploader.publishing.create_preview", side_effect=preview), patch.object(self.app, "open_review") as opened:
+            self.app.stage_buttons[0].invoke()
+            self.wait_for_check()
+            opened.assert_called_once()
+            self.assertIsNotNone(self.app.prepared_batch)
+            batch = self.app.prepared_batch
+            self.assertEqual(self.app.server_ops.task["source"]["path"], self.app.result["review_songlist"])
+            def publish(*args, **kwargs):
+                return publish_update(*args, **kwargs, transport_factory=MemoryUpload)
+            MemoryUpload.fail_after, MemoryUpload.files = None, {}
+            with patch("arcaea_uploader.gui.messagebox.askyesno", return_value=True), patch(
+                    "arcaea_uploader.publishing.publish_update", side_effect=publish):
+                self.app.stage_buttons[1].invoke()
+                self.wait_for_check()
+        self.assertIsNotNone(self.app.result, self.app.details.get("1.0", "end"))
+        self.assertEqual(self.app.result["mode"], "published", self.app.details.get("1.0", "end"))
+        self.assertTrue(batch.exists())
+        self.assertEqual(self.app.prepared_batch, batch)
+        self.assertEqual(self.app.server_ops.task["publication"]["kind"], "verified")
+        self.assertIn("02 已上传", self.app.summary.get())
+        self.assertTrue(all(str(button["state"]) == "normal" for button in self.app.stage_buttons))
+        from test_server_tasks import FakeAPI
+        self.app.variables[("api", "base_url")].set(FakeAPI.base_url)
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=True), patch(
+                "arcaea_uploader.server_tasks_gui.ApiClient.from_settings", return_value=FakeAPI()):
+            self.app.server_ops.execute()
+            self.wait_for_check()
+        self.assertTrue(batch.exists())
+        self.assertEqual(str(self.app.server_ops.commit_button["state"]), "normal")
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=False):
+            self.app.server_ops.commit()
+        self.assertTrue(batch.exists())
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=True):
+            self.app.server_ops.commit()
+            self.wait_for_check()
+        self.assertFalse(batch.exists())
+        self.assertIsNone(self.app.prepared_batch)
+        self.assertEqual(self.app.result["mode"], "committed")
+
+    def test_tabs_keep_identical_shape_and_padding_when_selected(self):
+        style = self.app.style
+        self.assertEqual(style.layout("TNotebook.Tab")[0][0], "Uploader.tab")
+        self.assertEqual(str(style.lookup("TNotebook.Tab", "padding", ("selected",))),
+                         str(style.lookup("TNotebook.Tab", "padding", ("!selected",))))
+        self.assertEqual(str(style.lookup("TNotebook.Tab", "relief", ("selected",))), "flat")
+        self.assertEqual(str(style.lookup("TNotebook.Tab", "relief", ("!selected",))), "flat")
+        self.assertEqual(str(style.lookup("TNotebook.Tab", "expand", ("selected",))),
+                         str(style.lookup("TNotebook.Tab", "expand", ("!selected",))))
+        self.assertNotEqual(style.lookup("TNotebook.Tab", "background", ("selected",)),
+                            style.lookup("TNotebook.Tab", "background", ("!selected",)))
+
+    def test_pending_workspaces_warn_on_new_directory_and_restore_each_server_profile(self):
+        from test_publishing import PublishingTests
+        fixtures = []
+        for host in ("one.example.test", "two.example.test"):
+            fixture = PublishingTests("test_complete_two_stage_workflow_with_final_review_preview_and_task")
+            fixture.setUp()
+            fixtures.append(fixture)
+            def cleanup(fixture=fixture):
+                fixture.doCleanups()
+                fixture.tearDown()
+            self.addCleanup(cleanup)
+            fixture.settings["ssh"]["host"] = host
+            fixture.settings["api"]["base_url"] = "https://" + host + "/api/v1"
+        first, second = fixtures
+        first_plan, first_batch = first.prepare()
+        self.app._fill(first.settings)
+        with patch.object(self.app, "open_review"):
+            self.app.resume_workspace(first_batch)
+        self.app.server_ops.task["constants"]["validid"]["2"] = 9.8
+        self.assertTrue(self.app.server_ops.save())
+        self.app._fill(second.settings)
+        with patch("arcaea_uploader.gui.messagebox.askyesnocancel", return_value=None) as prompt:
+            self.assertFalse(self.app.choose_directory_with_pending(second.settings["local"]["input_root"]))
+        prompt.assert_called_once()
+        self.assertEqual(self.app.prepared_batch, first_batch)
+        with patch("arcaea_uploader.gui.messagebox.askyesnocancel", return_value=False):
+            self.assertTrue(self.app.choose_directory_with_pending(second.settings["local"]["input_root"]))
+        self.assertIsNone(self.app.prepared_batch)
+        second_plan, second_batch = second.prepare()
+        self.app.close()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = UploaderApp(self.root, self.config)
+        self.assertEqual(len(self.app.workspace_entries()), 2)
+        with patch.object(self.app, "open_review"):
+            self.app.resume_workspace(first_batch)
+        self.assertEqual(self.app.variables[("ssh", "host")].get(), "one.example.test")
+        self.assertEqual(self.app.server_ops.task["constants"]["validid"]["2"], 9.8)
+        with patch.object(self.app, "open_review"):
+            self.app.resume_workspace(second_batch)
+        self.assertEqual(self.app.variables[("api", "base_url")].get(), "https://two.example.test/api/v1")
+        self.app.manage_workspaces()
+        self.wait_for_workspace_list()
+        self.assertEqual(len(self.app.workspace_manager.tree.get_children()), 2)
+        with patch.object(self.root, "state", return_value="normal"), patch(
+                "arcaea_uploader.gui.messagebox.askyesnocancel", return_value=False) as prompt:
+            self.app.offer_resume()
+        self.assertIn("2 个未提交", prompt.call_args.args[1])
+
+    def test_close_saves_a_constant_cell_that_has_not_yet_received_enter(self):
+        from arcaea_uploader.server_tasks import load_task
+        panel = self.prepare_stage03()
+        path = panel.path
+        entry = ttk.Entry(self.root)
+        entry.insert(0, "9.9")
+        panel.editor = (entry, "sample", 2)
+        self.app.close()
+        self.assertEqual(load_task(path)["constants"]["sample"]["2"], 9.9)
+
+    def test_01_appends_selected_directory_and_new_batch_is_explicit(self):
+        from test_preprocess import song_metadata
+        from test_publishing import preview
+        self.make_package()
+        (self.workspace / "incoming/sample/songlist.json").write_text(json.dumps(song_metadata("sample")), encoding="utf-8")
+        for name in ("packlist", "unlocks"):
+            (self.workspace / "active/songs" / name).write_text("{}", encoding="utf-8")
+        (self.workspace / "active/metadata.oldjson").write_text(json.dumps([
+            {"applicationVersionNumber": "7.0.256", "versionNumber": "7.0.256.4"}]), encoding="utf-8")
+        second = self.workspace / "another-input/second"
+        second.mkdir(parents=True)
+        (second / "2.aff").write_bytes(b"chart")
+        (second / "base.ogg").write_bytes(b"full audio")
+        Image.new("RGB", (384, 384)).save(second / "base.jpg")
+        (second / "songlist").write_text(json.dumps(song_metadata("second")), encoding="utf-8")
+        with patch("arcaea_uploader.publishing.create_preview", side_effect=preview), patch.object(self.app, "open_review"), patch(
+                "arcaea_uploader.gui.messagebox.askyesno", return_value=True):
+            self.app.stage_buttons[0].invoke()
+            self.wait_for_check()
+            batch = self.app.prepared_batch
+            review = Path(self.app.result["review_songlist"])
+            document = json.loads(review.read_text(encoding="utf-8"))
+            document["songs"][0]["purchase"] = "reviewed-pack"
+            review.write_text(json.dumps(document), encoding="utf-8")
+            self.app.server_ops.task["constants"]["sample"]["2"] = 9.7
+            self.app.input_var.set(str(second.parent))
+            self.app.stage_buttons[0].invoke()
+            self.wait_for_check()
+            self.assertEqual(self.app.prepared_batch, batch)
+            self.assertEqual(len(self.app.result["songs"]), 2, self.app.details.get("1.0", "end"))
+            self.assertEqual(self.app.server_ops.task["actual"], {"sample": [2], "second": [2]})
+            self.assertEqual(self.app.server_ops.task["constants"]["sample"]["2"], 9.7)
+            self.assertEqual(json.loads(review.read_text(encoding="utf-8"))["songs"][0]["purchase"], "reviewed-pack")
+            self.assertIn("累计 2 首", self.app.status.get())
+            # Closing and selecting this workspace does not rebuild its review.
+            self.app.resume_workspace(batch)
+            self.assertEqual(self.app.prepared_batch, batch)
+            self.assertEqual(len(self.app.result["songs"]), 2)
+            self.assertEqual(self.app.server_ops.task["constants"]["sample"]["2"], 9.7)
+            self.app.new_batch_button.invoke()
+            self.assertIsNone(self.app.prepared_batch)
+            self.assertTrue(batch.exists())
+            self.app.stage_buttons[0].invoke()
+            self.wait_for_check()
+            self.assertNotEqual(self.app.prepared_batch, batch)
+            self.assertEqual(len(self.app.result["songs"]), 1)
 
     def test_worker_failure_leaves_window_usable_for_retry(self):
         self.app.start_check()
@@ -322,12 +499,14 @@ class GuiTests(unittest.TestCase):
         self.app.start_preprocess()
         self.wait_for_check()
         batch = self.app.result["batch_root"]
+        (Path(batch) / "workspace.json").unlink()  # Older batches did not have a marker.
         self.app.close()
         self.root = tk.Tk()
         self.root.withdraw()
         self.app = UploaderApp(self.root, self.config)
         self.assertIsNone(self.app.preprocessed)
         self.app.workspace_button.invoke()
+        self.wait_for_workspace_list()
         manager = self.app.workspace_manager
         item = manager.tree.get_children()[0]
         manager.tree.selection_set(item)
@@ -341,6 +520,27 @@ class GuiTests(unittest.TestCase):
         self.wait_for_check()
         self.assertEqual(self.app.result["preprocessing_report"], str(Path(batch) / "report.json"))
 
+    def test_workspace_window_is_responsive_while_directory_scan_is_pending(self):
+        from threading import Event
+        release = Event()
+        def slow_scan(*args):
+            release.wait(3)
+            return []
+        with patch("arcaea_uploader.workspace_gui.session_entries", side_effect=slow_scan):
+            try:
+                self.app.manage_workspaces()
+                manager = self.app.workspace_manager
+                self.assertTrue(manager.loading)
+                heartbeat = []
+                self.root.after(0, lambda: heartbeat.append(True))
+                self.root.update()
+                self.assertTrue(heartbeat, "Filesystem scanning blocked Tk events")
+                self.assertIn("正在读取", manager.detail.get())
+            finally:
+                release.set()
+            self.wait_for_workspace_list()
+            self.assertFalse(manager.tree.get_children())
+
     def test_workspace_manual_delete_requires_click_confirmation_and_invalidates_cache(self):
         from test_preprocess import song_metadata
         self.make_package()
@@ -350,6 +550,7 @@ class GuiTests(unittest.TestCase):
         self.wait_for_check()
         batch = Path(self.app.result["batch_root"])
         self.app.workspace_button.invoke()
+        self.wait_for_workspace_list()
         manager = self.app.workspace_manager
         manager.tree.selection_set(manager.tree.get_children()[0])
         manager.select()

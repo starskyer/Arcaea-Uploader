@@ -46,7 +46,7 @@ class ImportDecisionsTests(unittest.TestCase):
     def process(self, **kwargs):
         return preprocess_collection(self.input, self.output, assets_root=self.assets, import_version="2026.11", **kwargs)
 
-    def test_version_overrides_all_song_and_difficulty_values_and_inserts_missing_keys(self):
+    def test_version_overrides_song_only_without_generating_difficulty_versions(self):
         row = song_metadata()
         row.pop("version")
         row["remote_dl"] = False
@@ -59,7 +59,8 @@ class ImportDecisionsTests(unittest.TestCase):
         result = report["packages"][0]["songlist"]
         self.assertEqual(result["version"], "2026.11")
         self.assertTrue(result["remote_dl"])
-        self.assertTrue(all(d["version"] == "2026.11" for d in result["difficulties"]))
+        self.assertEqual(result["difficulties"][0]["version"], "old")
+        self.assertNotIn("version", result["difficulties"][1])
         self.assertEqual(result["difficulties"][0]["rating"], 0)
         self.assertEqual((folder / "songlist").read_bytes(), before)
 
@@ -264,7 +265,9 @@ class ImportDecisionsTests(unittest.TestCase):
         by_rating = {d["ratingClass"]: d for d in result["difficulties"]}
         self.assertEqual(by_rating[2]["chartDesigner"], "Real")
         self.assertEqual(by_rating[0]["rating"], 0)
-        self.assertTrue(all(d["version"] == "2026.11" for d in by_rating.values()))
+        self.assertEqual(by_rating[2]["version"], "old")
+        self.assertNotIn("version", by_rating[0])
+        self.assertNotIn("version", by_rating[3])
         self.assertEqual(merged["songs"][1], original["songs"][1])
         self.assertEqual(master, original)
 

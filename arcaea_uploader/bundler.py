@@ -1,7 +1,7 @@
 """Application adapter for the unmodified, MIT-licensed Arcaea-Bundler core.
 
 Builds are intended for a release workspace: successful builds update its
-metadata.oldjson. The GUI publish workflow is not connected yet.
+metadata.oldjson. Stage 02 uses a private snapshot before installing the result.
 """
 
 from __future__ import annotations

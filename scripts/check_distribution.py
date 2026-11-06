@@ -25,6 +25,8 @@ def check(path):
         parts = Path(name).parts
         if any(part in forbidden or part.startswith(".venv") for part in parts):
             raise ValueError(f"Private/generated content in {path.name}: {name}")
+        if name.endswith(".workspaces.json") or Path(name).name in {"server-task.json", "workspace.json", "receipt.json", "publish.json"}:
+            raise ValueError(f"Workspace runtime state in {path.name}: {name}")
         if name.endswith((".cb", ".oldjson", ".aff", ".ogg", ".mp4", ".lnk", ".pem", ".key")):
             raise ValueError(f"Resource or credential file in {path.name}: {name}")
     if not any(name.endswith("arcaea_bundler/LICENSE") for name in names):
@@ -49,6 +51,10 @@ def check(path):
             raise ValueError("Portable archive is missing the executable or example config")
         if not any(name.endswith("THIRD_PARTY_LICENSES.json") for name in names):
             raise ValueError("Portable archive is missing runtime notices")
+        if not any("/sources/paramiko-" in name and name.endswith(".tar.gz") for name in names):
+            raise ValueError("Portable archive is missing Paramiko corresponding source")
+        if not any(name.endswith("_internal/paramiko/client.py") for name in names):
+            raise ValueError("Paramiko must remain outside the executable archive")
     print("Checked", path.name, "-", len(names), "files")
 
 

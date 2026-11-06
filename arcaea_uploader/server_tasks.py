@@ -27,6 +27,24 @@ def fingerprint(data):
     return sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()
 
 
+def completion_signature(task):
+    return fingerprint({key: task.get(key) for key in
+        ("songs", "actual", "constants", "options", "source", "publication", "endpoint")})
+
+
+def finish_task(task, *, skipped=False):
+    if skipped and any(task["options"].values()):
+        raise PlanError("仍有启用的 03 操作，不能标记全部跳过。")
+    task["state"] = "skipped" if skipped else "complete"
+    task["completion_signature"] = completion_signature(task)
+
+
+def task_complete(task):
+    return (task.get("state") in {"complete", "skipped"}
+            and task.get("completion_signature") == completion_signature(task)
+            and (task["state"] != "skipped" or not any(task["options"].values())))
+
+
 def english_name(row):
     localized = row.get("title_localized")
     value = localized.get("en") if isinstance(localized, dict) else None
@@ -79,7 +97,7 @@ def make_task(task_id, document, actual, previous=None):
     if previous:
         if previous.get("id") != task_id:
             raise PlanError("03 任务标识不匹配。")
-        for key in ("created_at", "constants", "options", "progress", "managed_purchases", "endpoint", "revision", "input_errors"):
+        for key in ("created_at", "constants", "options", "progress", "managed_purchases", "endpoint", "revision", "input_errors", "completion_signature"):
             if key in previous:
                 task[key] = deepcopy(previous[key])
         if selected == previous["songs"] and task["actual"] == previous["actual"]:
@@ -88,17 +106,31 @@ def make_task(task_id, document, actual, previous=None):
     # A removed difficulty must not leave a writable constant behind.
     task["constants"] = {sid: {str(c): task["constants"].get(sid, {}).get(str(c)) for c in classes}
                          for sid, classes in task["actual"].items()}
+    update_purchase_candidates(task)
     return task
 
 
-def task_path(release_root, task_id):
+def task_path(release_root, task_id, *, create=True):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", task_id):
         raise PlanError("03 任务标识无效。")
-    directory = Path(release_root).resolve() / ".server-tasks"
+    root = Path(release_root).resolve()
+    workspace = root / task_id
+    if workspace.is_dir() and (workspace / "publish.json").is_file():
+        from .workspaces import load_workspace
+        load_workspace(root, workspace)
+        return workspace / "server-task.json"
+    directory = root / ".server-tasks"
     if directory.exists() and linked(directory):
         raise PlanError("03 任务目录不能是链接。")
-    directory.mkdir(parents=True, exist_ok=True)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
     return directory / (task_id + ".json")
+
+
+def existing_task_path(release_root, task_id):
+    path = task_path(release_root, task_id, create=False)
+    legacy = Path(release_root).resolve() / ".server-tasks" / (task_id + ".json")
+    return path if path.exists() or not legacy.exists() else legacy
 
 
 @contextmanager
@@ -131,15 +163,22 @@ def task_lock(path):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def save_task(path, task, *, locked=False):
+def save_task(path, task, *, locked=False, workspace_locked=False):
     if task.get("owner") != "Arcaea-Uploader/server-task":
         raise PlanError("不是有效的 03 任务。")
     path = Path(path)
     if path.parent.exists() and linked(path.parent):
         raise PlanError("03 任务目录不能是链接或目录联接。")
     if not locked:
+        if path.name == "server-task.json" and (path.parent / "publish.json").is_file() and not workspace_locked:
+            from .workspaces import workspace_lock
+            with workspace_lock(path.parent.parent, path.parent):
+                return save_task(path, task, workspace_locked=True)
         with task_lock(path):
             return save_task(path, task, locked=True)
+    update_purchase_candidates(task)
+    if task.get("state") in {"complete", "skipped"} and not task_complete(task):
+        task["state"] = "draft"
     if path.exists():
         current = read_json(path)
         if (current.get("owner") != task["owner"] or current.get("id") != task["id"]
@@ -234,6 +273,14 @@ def purchase_specs(task):
     return list(specs.values())
 
 
+def update_purchase_candidates(task):
+    try:
+        task["purchase_candidates"] = purchase_specs(task)
+        task["purchase_errors"] = []
+    except PlanError as error:
+        task["purchase_candidates"], task["purchase_errors"] = [], [str(error)]
+
+
 def _chart_map(data):
     values = {i: -1 for i in range(5)}
     for chart in (data or {}).get("charts", []):
@@ -265,7 +312,7 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
     if task.get("endpoint") and task["endpoint"] != api.base_url:
         raise PlanError("该 03 任务属于另一 API 地址，请为新服务器建立任务。")
     if not any(task["options"].values()):
-        task["state"] = "skipped"
+        finish_task(task, skipped=True)
         persist(task)
         return task
     missing = missing_constants(task)
@@ -276,6 +323,9 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
         for row in task["songs"]:
             if not isinstance(english_name(row), str) or not english_name(row).strip():
                 raise PlanError(f"{row['id']}: 缺少 title_localized.en 或 title，无法确定英文名。")
+    task["state"] = "preflight"
+    task.pop("completion_signature", None)
+    persist(task)
     required = list(RESOURCE_OPERATIONS) if task["options"]["refresh_resources"] else []
     if task["options"]["refresh_rating"]:
         required.append(RATING_OPERATION)
@@ -407,6 +457,6 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
     if task["options"]["refresh_rating"]:
         step("refresh:" + RATING_OPERATION, [task["songs"], task["actual"], task["constants"]],
              lambda: api.request("POST", "/system/operations/" + RATING_OPERATION, {}))
-    task["state"] = "complete"
+    finish_task(task)
     persist(task)
     return task

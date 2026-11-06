@@ -18,6 +18,7 @@ def run_smoke_test(output: Path) -> int:
         import tkinter as tk
         import ssl
         from PIL import Image, __version__ as pillow_version
+        import paramiko
         from .backgrounds import complete_inverse
         from .bundle_versions import resolve_bundle_versions
         from .bundler import build_configured_bundle
@@ -28,6 +29,9 @@ def run_smoke_test(output: Path) -> int:
         root.withdraw()
         report["checks"]["tk"] = root.tk.call("info", "patchlevel")
         report["checks"]["pillow"] = pillow_version
+        report["checks"]["ssh_client"] = paramiko.__version__
+        # Exercise a packaged cryptographic backend, without contacting a host.
+        report["checks"]["ssh_crypto"] = paramiko.RSAKey.generate(1024).get_bits() == 1024
         report["checks"]["tls_context"] = ssl.create_default_context().verify_mode == ssl.CERT_REQUIRED
         data = BytesIO()
         Image.new("RGB", (2, 2)).save(data, format="PNG")
@@ -59,10 +63,16 @@ def run_smoke_test(output: Path) -> int:
             if len(application.stage_buttons) != 3 or not application.follow_app_version_var.get():
                 raise ValueError("Desktop initialization failed")
             report["checks"]["desktop"] = True
+            if any(str(button["state"]) != "normal" or not button["command"] for button in application.stage_buttons[:2]):
+                raise ValueError("Stage 01/02 buttons are not connected")
+            report["checks"]["stage01_stage02"] = True
             application.stage_buttons[2].invoke()
             if application.results.select() != str(application.server_ops.frame):
                 raise ValueError("Stage 03 editor is not available")
             report["checks"]["stage03_editor"] = True
+            if not application.server_ops.commit_button["command"]:
+                raise ValueError("Final workspace commit is not available")
+            report["checks"]["stage03_commit"] = True
             application.show_help(("api", "token_env"))
             if "ARCAEA_UPLOADER_API_TOKEN" not in application.help_text.get("1.0", "end"):
                 raise ValueError("Field help was not packaged")

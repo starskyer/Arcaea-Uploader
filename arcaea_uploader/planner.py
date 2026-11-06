@@ -278,7 +278,7 @@ def build_plan(config: dict) -> dict:
     plan: dict[str, Any] = {
         "schema_version": 1, "mode": "read_only_plan", "publishable": False,
         "errors": [], "warnings": [], "songs": [], "files": [], "preview_jobs": [], "diagnostics": [],
-        "note": "No files modified. Media jobs are not final byte differences; build/upload is not implemented.",
+        "note": "No files modified. Media jobs describe preparation; use stage 01/02 to prepare and publish.",
     }
     emit(plan["diagnostics"], "info", "background.table", f"使用背景翻转对应表 {len(pairs)} 组，均可双向推导。")
     for bg, choices in pair_conflicts.items():
@@ -346,7 +346,10 @@ def build_plan(config: dict) -> dict:
         # Media conversion is deferred; comparing original JPG/OGG bytes is misleading.
         action = "prepare_media" if media else (
             "unchanged" if target_hash == source_hash else "replace" if target_hash else "add")
-        if action == "replace":
+        if (action == "replace" and area == "database" and source.suffix == ".aff"
+                and is_empty_aff(target.read_bytes())):
+            emit(plan["diagnostics"], "info", "chart.replace_placeholder", f"真实谱面将替换已有占位谱：{relative}。")
+        elif action == "replace":
             plan["errors"].append(f"Existing file differs: {area}/{relative}")
         plan["files"].append({"source": str(source), "area": area, "path": relative,
                               "action": action, "source_sha256": source_hash,
@@ -408,7 +411,7 @@ def build_plan(config: dict) -> dict:
                 plan["warnings"].append(f"{song_id}: video_1080.mp4 is not declared in songlist.additional_files")
             for name in available:
                 if re.fullmatch(r"[0-4]\.ogg", name) and name != "3.ogg":
-                    plan["warnings"].append(f"{song_id}: upstream preview script does not support {name}; conversion rule pending")
+                    plan["warnings"].append(f"{song_id}: {name} 将生成 {name[0]}_preview.ogg；原服务端仅特殊处理 3.ogg，需人工确认下载声明与客户端兼容。")
         except (OSError, ValueError) as exc:
             plan["errors"].append(f"{song_id}: {exc}")
     available_bg = backgrounds.existing_ids | {Path(f["path"]).stem.casefold() for f in plan["files"]

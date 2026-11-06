@@ -56,11 +56,10 @@ def normalize_import_row(row, version, actual, log):
     validate_rating_values(row)
     row["version"] = version
     row["remote_dl"] = True
-    log("info", "metadata.version", f"曲目及所有声明难度的 version 统一使用 {version}。")
+    log("info", "metadata.version", f"曲目顶层 version 统一使用 {version}；不新增难度 version。")
     log("info", "metadata.remote_dl", "已设置 remote_dl=true。")
     for difficulty in row.get("difficulties", []):
         rating = difficulty["ratingClass"]
-        difficulty["version"] = version
         if rating not in actual:
             old = difficulty.get("rating")
             difficulty["rating"] = 0

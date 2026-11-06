@@ -1,6 +1,7 @@
 """Owned temporary batches, process locks and verified publication cleanup."""
 
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import os
@@ -93,6 +94,67 @@ def initialize_workspace(batch, input_root, import_version):
     })
 
 
+def workspace_marker(root, batch):
+    """Read a validated legacy workspace without requiring its newer marker."""
+    report = load_workspace(root, batch)
+    path = Path(batch) / "workspace.json"
+    if path.exists():
+        return _read(path)
+    return {"owner": "Arcaea-Uploader", "schema_version": 1,
+            "created_at": timestamp(), "input_root": report["input_root"],
+            "import_version": report.get("import_version", "")}
+
+
+def snapshot_workspace_settings(batch, settings):
+    """Save public configuration fields; never copy credentials or env values."""
+    from .settings import default_settings
+    path = Path(batch) / "workspace.json"
+    marker = workspace_marker(Path(batch).parent, batch)
+    marker["settings"] = {section: {key: deepcopy(settings[section][key]) for key in defaults}
+                          for section, defaults in default_settings().items()}
+    marker["updated_at"] = timestamp()
+    write_json(path, marker)
+
+
+def workspace_settings(root, batch, current, origin):
+    from .settings import effective_settings
+    marker = workspace_marker(root, batch)
+    values = deepcopy(marker.get("settings") or current)
+    if not marker.get("settings"):
+        values["local"]["input_root"] = marker["input_root"]
+        if marker.get("import_version"):
+            values["import"]["version"] = marker["import_version"]
+    publication = Path(batch) / "publish.json"
+    if publication.is_file():
+        record = _read(publication)
+        binding = record.get("binding", {})
+        if not marker.get("settings"):
+            for key in ("import", "bundle"):
+                if key in binding:
+                    values[key] = deepcopy(binding[key])
+            values["local"].update(binding.get("local", {}))
+        # The immutable import policy also includes automatically learned pairs.
+        values["import"] = deepcopy(binding.get("import", values["import"]))
+        pending = record.get("pending_append") or {}
+        values["local"]["input_root"] = pending.get("input_root", binding.get("local", {}).get(
+            "input_root", values["local"]["input_root"]))
+    values["local"]["release_root"] = str(Path(root).resolve())
+    return effective_settings(values, origin)
+
+
+def sync_workspace_task(root, batch, document, actual):
+    from .server_tasks import (existing_task_path, load_task, make_task, read_reviewed, save_task, task_path)
+    batch = Path(batch)
+    old_path = existing_task_path(root, batch.name)
+    previous = load_task(old_path) if old_path.is_file() else None
+    task = make_task(batch.name, document, actual, previous)
+    task = read_reviewed(task, batch / "prepared/active/songs/songlist")
+    task["input_errors"] = []
+    path = task_path(root, batch.name)
+    save_task(path, task, workspace_locked=True)
+    return path, task
+
+
 def list_workspaces(root):
     root = Path(root).expanduser().resolve()
     if not root.exists():
@@ -104,8 +166,34 @@ def list_workspaces(root):
         try:
             report = load_workspace(root, batch)
             row.update(managed=True, report=report)
+            saved = _read(batch / "workspace.json").get("settings", {}) if (batch / "workspace.json").is_file() else {}
+            ssh = saved.get("ssh", {})
+            row["server"] = ((ssh["host"] + ":" + str(ssh.get("port", 22)) + " " + ssh.get("server_project_root", ""))
+                             if ssh.get("host") else saved.get("local", {}).get("server_project_root", "未绑定"))
             row["state"] = ("中断 / 可继续" if not report.get("complete") else
                             "需处理 / 可继续" if not report.get("valid") else "预处理完成")
+            publication = batch / "publish.json"
+            if publication.is_file():
+                publication_data = _read(publication)
+                state = publication_data.get("state")
+                row["state"] = {"preparing": "01 中断 / 继续准备", "blocked": "01 待处理 / 可继续",
+                    "review": "01 完成 / 待审核", "building": "构建中断 / 继续 02",
+                    "built": "已打包 / 继续 02", "local_verified": "本地完成 / 继续上传",
+                    "remote_verified": "已上传 / 继续 02 交接", "awaiting_stage03": "02 已上传 / 待 03",
+                    "committed_cleanup_pending": "已提交 / 待清理"}.get(state, row["state"])
+                if state == "awaiting_stage03" and (batch / "server-task.json").is_file():
+                    from .server_tasks import load_task, task_complete
+                    task = load_task(batch / "server-task.json")
+                    if task_complete(task):
+                        row["state"] = "03 完成 / 待确认提交"
+                    elif task["state"] in {"failed", "uncertain", "preflight", "running"}:
+                        row["state"] = "03 未完成 / 可继续"
+                pending = publication_data.get("pending_append")
+                if pending:
+                    row["state"] = "追加待处理 / 继续 01"
+                    row["pending_errors"] = len(pending.get("errors", []))
+                if (batch / "append-transaction.json").exists():
+                    row["state"] = "追加提交中断 / 继续恢复"
         except (ValueError, OSError) as exc:
             row["error"] = str(exc)
             try:
@@ -169,7 +257,18 @@ def _delete(root, batch):
     root, batch = _locations(root, batch)
     load_workspace(root, batch, require_report=False)
     ensure_plain_tree(batch)
-    shutil.rmtree(batch)
+    remove_plain_tree(batch)
+
+
+def remove_plain_tree(path):
+    """Remove a caller-validated private tree, including Windows read-only files."""
+    ensure_plain_tree(path)
+    def retry_readonly(function, target, error):
+        if not isinstance(error[1], PermissionError) or not Path(target).is_file() or linked(Path(target)):
+            raise error[1]
+        os.chmod(target, Path(target).stat().st_mode | stat.S_IWUSR)
+        function(target)
+    shutil.rmtree(path, onerror=retry_readonly)
 
 
 def delete_workspace(root, batch):
@@ -179,53 +278,102 @@ def delete_workspace(root, batch):
 
 
 def cleanup_published_workspace(root, batch, receipt):
-    """Stage 02 cleans verified uploads; optional stage 03 keeps a small task.
+    """Compatibility entry point; cleanup now requires the final 03 commit."""
+    actual = _read(Path(batch) / "receipt.json") if (Path(batch) / "receipt.json").is_file() else None
+    if not actual or any(actual.get(k) != receipt.get(k) for k in
+                         ("batch_id", "local_verified", "remote_verified", "songlist_sha256")):
+        raise PlanError("02 上传凭据不足以销毁工作区，请完成 03 并确认提交。")
+    return commit_workspace(root, batch)
 
-    The publishing executor is not wired yet. It must supply verified facts;
-    neither a successful preflight nor a UI click constitutes this receipt.
-    """
+
+def verify_workspace_publication(root, batch, task):
+    from .planner import digest
     root, batch = _locations(root, batch)
-    if (not isinstance(receipt, dict) or receipt.get("batch_id") != batch.name or receipt.get("local_verified") is not True
-            or receipt.get("remote_verified") is not True):
-        raise PlanError("尚未确认本地和远端资源，保留临时批次供重试。")
-    post_file = receipt.get("server_task_file")
-    post_relative = None
-    if post_file:
-        from .server_tasks import load_task
-        post_path = Path(post_file).resolve(strict=True)
-        expected = root / ".server-tasks" / (batch.name + ".json")
-        if post_path != expected or linked(Path(post_file)) or linked(post_path.parent):
-            raise PlanError("03 任务必须位于本工作区独立的 .server-tasks 目录。")
-        post = load_task(post_path)
-        if (post["id"] != batch.name or (post.get("publication") or {}).get("kind") != "verified"
-                or not post.get("source")
-                or post["publication"].get("songlist_sha256") != post["source"].get("sha256")
-                or receipt.get("songlist_sha256") != post["source"].get("sha256")):
-            raise PlanError("尚未保存与 02 上传结果绑定的 03 任务。")
-        reviewed = Path(post["source"]["path"])
-        if reviewed.is_file():
-            from .planner import digest
-            if digest(reviewed) != post["source"]["sha256"]:
-                raise PlanError("02 核验后审核总表发生变化，保留工作区。")
-        post_relative = str(post_path.relative_to(root))
-    elif (receipt.get("server_operations") != "skipped"
-          and receipt.get("refresh") not in {"succeeded", "server_stopped_confirmed"}):
-        # Accept old completed receipts, but never lose newly deferred work.
-        raise PlanError("清理前须保存独立 03 任务，或明确跳过 03。")
+    load_workspace(root, batch)
+    record = _read(batch / "publish.json")
+    receipt = _read(batch / "receipt.json") if (batch / "receipt.json").is_file() else {}
+    publication, source = task.get("publication") or {}, task.get("source") or {}
+    expected = batch / "prepared/active/songs/songlist"
+    if (receipt.get("batch_id") != batch.name or receipt.get("local_verified") is not True
+            or receipt.get("remote_verified") is not True or task.get("id") != batch.name
+            or publication.get("kind") != "verified" or not record.get("build")
+            or receipt.get("songlist_sha256") != record["build"].get("songlist_sha256")
+            or receipt.get("songlist_sha256") != source.get("sha256")
+            or publication.get("songlist_sha256") != source.get("sha256")
+            or Path(source.get("path", "")).resolve() != expected.resolve()
+            or not expected.is_file() or digest(expected) != source["sha256"]):
+        raise PlanError("尚未完成 02，或审核总表与已上传内容不一致；保留工作区。")
+    if record.get("pending_append") or task.get("input_errors"):
+        raise PlanError("工作区仍有未解决的 ERROR。")
+    return receipt, record
+
+
+def verify_workspace_api(root, batch, settings):
+    marker = workspace_marker(root, batch)
+    snapshot = marker.get("settings", {})
+    expected = snapshot.get("api", {}).get("base_url", "").rstrip("/")
+    selected = settings["api"]["base_url"].rstrip("/")
+    if expected and expected != selected:
+        raise PlanError("管理 API 与本工作区保存的服务器不一致，请恢复工作区配置后再执行 03。")
+
+
+def bind_workspace_api(root, batch, settings):
+    with workspace_lock(root, batch):
+        verify_workspace_api(root, batch, settings)
+        path = Path(batch) / "workspace.json"
+        marker = workspace_marker(root, batch)
+        if not marker.get("settings"):
+            snapshot_workspace_settings(batch, settings)
+            marker = _read(path)
+        marker["settings"]["api"] = {key: settings["api"][key] for key in ("base_url", "token_env")}
+        write_json(path, marker)
+
+
+def commit_workspace(root, batch, *, expected_revision=None):
+    """Explicit final commit: verified 02 + current successful/skipped 03."""
+    from .server_tasks import (load_task, task_complete, task_lock)
+    from .publishing import _check_hashes
+    root, batch = _locations(root, batch)
     with workspace_lock(root, batch):
         report = load_workspace(root, batch)
         if report.get("complete") is not True or report.get("valid") is not True:
             raise PlanError("批次尚未完成资源处理，保留工作区。")
-        history = root / ".history"
-        if os.path.lexists(history) and linked(history):
-            raise PlanError("发布记录目录不能是链接。")
-        history.mkdir(exist_ok=True)
-        path = history / (batch.name + ".json")
-        record = {"batch_id": batch.name, "completed_at": timestamp(),
-                  "local_verified": True, "remote_verified": True,
-                  "server_operations": "pending" if post_file else "skipped",
-                  "server_task_file": post_relative, "cleanup_complete": False}
-        write_json(path, record)
+        ensure_plain_tree(batch)
+        task_file = batch / "server-task.json"
+        if not task_file.is_file():
+            raise PlanError("工作区缺少 03 任务，不能提交清理。")
+        with task_lock(task_file):
+            task = load_task(task_file)
+            if expected_revision is not None and task["revision"] != expected_revision:
+                raise PlanError("确认期间定数或操作选项已改变，请重新检查后提交。")
+            receipt, publication = verify_workspace_publication(root, batch, task)
+            if not task_complete(task):
+                raise PlanError("03 尚未成功完成，或定数 / 选项已改变，请先执行 03；保留工作区。")
+            _check_hashes(batch / "prepared/active", publication["build"]["final_assets"])
+            _check_hashes(batch / "prepared/database", publication["prepared_database"])
+            _check_hashes(batch / "songs", publication["normalized_sha256"])
+            snapshot = workspace_marker(root, batch).get("settings")
+            if snapshot and any(task["options"].values()):
+                verify_workspace_api(root, batch, {"api": {"base_url": task.get("endpoint", "")}})
+            history = root / ".history"
+            archived = root / ".server-tasks"
+            for directory in (history, archived):
+                if os.path.lexists(directory) and linked(directory):
+                    raise PlanError("工作区归档目录不能是链接。")
+                directory.mkdir(exist_ok=True)
+            archive_task = archived / (batch.name + ".json")
+            with task_lock(archive_task):
+                write_json(archive_task, task)
+            path = history / (batch.name + ".json")
+            record = {"batch_id": batch.name, "completed_at": timestamp(), "committed": True,
+                      "local_verified": True, "remote_verified": True, "bundle_version": publication["build"]["version"],
+                      "songlist_sha256": receipt["songlist_sha256"], "server_operations": task["state"],
+                      "completion_signature": task["completion_signature"], "options": task["options"],
+                      "server_task_file": str(archive_task.relative_to(root)), "cleanup_complete": False}
+            write_json(path, record)
+            publication["state"] = "committed_cleanup_pending"
+            write_json(batch / "publish.json", publication)
+        # Close the task-file lock before deleting its directory on Windows.
         _delete(root, batch)
         record["cleanup_complete"] = True
         write_json(path, record)

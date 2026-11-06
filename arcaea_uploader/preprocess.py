@@ -337,7 +337,7 @@ def scan_collection(input_root: Path, *, master: dict | None = None, import_vers
 def preprocess_collection(input_root: Path, output_base: Path, *, master: dict | None = None,
                           ffmpeg_path: str = "", import_version="", assets_root=None, existing_songs=None,
                           background_pairs=None, background_pair_conflicts=None, initialize_background_pairs=True,
-                          on_diagnostic=None, resume_from: Path | None = None) -> dict:
+                          on_diagnostic=None, resume_from: Path | None = None, artifact_cache=()) -> dict:
     """Create or resume one batch; reuse only hash-verified, unchanged packages."""
     root, output_base = Path(input_root).resolve(strict=True), Path(output_base).resolve()
     if output_base.is_relative_to(root):
@@ -365,7 +365,7 @@ def preprocess_collection(input_root: Path, output_base: Path, *, master: dict |
         ensure_plain_tree(batch)
         if not (batch / "workspace.json").exists():
             initialize_workspace(batch, root, import_version)
-        return _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_diagnostic)
+        return _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_diagnostic, artifact_cache)
 
 
 def _fingerprint(data):
@@ -390,7 +390,7 @@ def _reusable(record, old, folder, same_context):
             and _output_manifest(folder) == old["output_sha256"])
 
 
-def _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_diagnostic):
+def _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_diagnostic, artifact_cache=()):
     songs = batch / "songs"
     songs.mkdir(exist_ok=True)
     report.update(mode="preprocess", complete=False, valid=False, batch_root=str(batch), normalized_root=str(songs),
@@ -398,6 +398,7 @@ def _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_di
                   updated_at=timestamp(), resumed=previous is not None)
 
     reusable = {}
+    cached_files = {(item["kind"], item["source_sha256"], item["target"]): item for item in artifact_cache}
     if previous:
         old_records = {p.get("source"): p for p in previous["packages"]}
         for record in report["packages"]:
@@ -461,7 +462,15 @@ def _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_di
                 target = work / action["target"]
                 if target.parent != work:
                     raise PlanError("无效的工作副本文件名。")
-                if action["kind"] == "thumbnail":
+                cached = cached_files.get((action["kind"], action["source_sha256"], action["target"]))
+                if (cached and Path(cached["output"]).is_file() and not _linked(Path(cached["output"]))
+                        and digest(Path(cached["output"])) == cached["sha256"]):
+                    shutil.copyfile(cached["output"], target)
+                    entry = emit(record["diagnostics"], "info", "file.reused",
+                                 f"源文件未变，复用已标准化资源 {action['target']}。", song_id=record["id"],
+                                 source=source, callback=on_diagnostic)
+                    report["diagnostics"].append(entry)
+                elif action["kind"] == "thumbnail":
                     make_thumbnail(source, target)
                 elif action["kind"] == "transcode":
                     transcode_audio(source, target, ffmpeg_path=ffmpeg_path)
@@ -520,5 +529,9 @@ def preprocess_settings(data: dict, origin: Path, *, scan_only: bool = False, on
         return scan_collection(Path(local["input_root"]), **options)
     if not local["release_root"]:
         raise PlanError("请先在配置页指定发布工作区。")
-    return preprocess_collection(Path(local["input_root"]), Path(local["release_root"]),
-                                 ffmpeg_path=local["ffmpeg_path"], resume_from=resume_from, **options)
+    report = preprocess_collection(Path(local["input_root"]), Path(local["release_root"]),
+                                   ffmpeg_path=local["ffmpeg_path"], resume_from=resume_from, **options)
+    from .workspaces import snapshot_workspace_settings
+    with workspace_lock(local["release_root"], report["batch_root"]):
+        snapshot_workspace_settings(report["batch_root"], config)
+    return report

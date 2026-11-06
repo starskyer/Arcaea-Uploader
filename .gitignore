@@ -1,5 +1,6 @@
 # Local configuration and notes
 /config.local.json
+*.workspaces.json
 /LOCAL.md
 /plan.local.json
 /*.lnk
