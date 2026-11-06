@@ -19,7 +19,8 @@ def check(path):
             names = archive.getnames()
             contents = {name: archive.extractfile(name).read() for name in names
                         if name.endswith(("config.example.json", "UPSTREAM.json"))}
-    forbidden = {"config.local.json", "LOCAL.md", ".env", ".git", ".ssh", "state", "database"}
+    forbidden = {"config.local.json", "LOCAL.md", ".env", ".git", ".ssh", "state", "database",
+                 ".server-tasks", ".locks", ".history"}
     for name in names:
         parts = Path(name).parts
         if any(part in forbidden or part.startswith(".venv") for part in parts):
@@ -38,9 +39,11 @@ def check(path):
     if not own_license:
         raise ValueError("Missing project MIT license in " + path.name)
     examples = [json.loads(data) for name, data in contents.items() if name.endswith("config.example.json")]
+    source_example = Path(__file__).resolve().parents[1] / "config.example.json"
+    expected_pairs = json.loads(source_example.read_text(encoding="utf-8"))["import"]["background_pairs"]
     for example in examples:
-        if len(example["import"]["background_pairs"]) < 36:
-            raise ValueError("The example background table is incomplete")
+        if example["import"]["background_pairs"] != expected_pairs:
+            raise ValueError("The packaged background table differs from the source example")
     if path.suffix == ".zip":
         if "Arcaea-Uploader/Arcaea-Uploader.exe" not in names or not examples:
             raise ValueError("Portable archive is missing the executable or example config")

@@ -20,6 +20,8 @@ from .preprocess import preprocess_settings
 from .import_rules import require_version
 from .backgrounds import normalize_pairs, pair_lookup
 from .diagnostics import summarize
+from .field_help import FIELD_HELP
+from .workspaces import load_workspace
 from .bundle_versions import latest_record, read_history, resolve_bundle_versions, validate_version
 from .settings import (
     default_config_path, default_settings, effective_settings, load_settings,
@@ -48,7 +50,7 @@ FIELDS = (
         ("private_key_path", "SSH 私钥", "file"),
         ("known_hosts_path", "已知主机文件", "file"),
     )),
-    ("资源刷新 API", "api", (
+    ("服务端管理 API", "api", (
         ("base_url", "管理 API 地址", "text"),
         ("token_env", "Token 环境变量名", "text"),
     )),
@@ -99,6 +101,10 @@ class UploaderApp:
         self.variables: dict[tuple[str, str], tk.Variable] = {}
         self._bundle_history_cache = None
         self.app_version_entries = []
+        self.help_buttons = {}
+        self.help_window = None
+        self.help_text = None
+        self.workspace_manager = None
         self.error_on_load = None
         if self.config_path.is_file():
             try:
@@ -112,6 +118,12 @@ class UploaderApp:
         self._style()
         self._build()
         self._fill(self.settings)
+        # Font and theme metrics vary by DPI; retain room for the result rows.
+        self.root.update_idletasks()
+        min_width, min_height = self.root.minsize()
+        required = self.root.winfo_reqheight() - self.results.winfo_reqheight() + self.px(220)
+        self.root.minsize(min_width, min(max(min_height, required),
+                                        self.root.winfo_screenheight() - self.px(80)))
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         if self.error_on_load:
             self._set_details("配置读取失败", [self.error_on_load])
@@ -140,6 +152,8 @@ class UploaderApp:
         self.style.configure("CardMuted.TLabel", background="#ffffff", foreground="#64748b")
         self.style.configure("Section.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
         self.style.configure("TButton", padding=(self.px(12), self.px(6)))
+        self.style.configure("Help.TButton", foreground="#2563eb", padding=self.px(2),
+                             font=("Segoe UI", 12), anchor="center")
         self.style.map("TButton", foreground=[("disabled", "#8491a4")])
         self.style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff", padding=(self.px(18), self.px(7)))
         self.style.map("Accent.TButton", background=[("disabled", "#cbd5e1"), ("active", "#1d4ed8")],
@@ -171,7 +185,7 @@ class UploaderApp:
         self.config_page = ttk.Frame(self.pages, padding=(self.px(16), self.px(14)))
         self.pages.add(self.home_page, text="更新")
         self.pages.add(self.config_page, text="配置")
-        self.status = tk.StringVar(value="选择来源目录，先预处理曲目，再检查资源变更。")
+        self.status = tk.StringVar(value="01/02 待接入 · 预处理、检查与可选 03 已可用 · ⓘ 查看说明。")
         self._home()
         self._config()
         footer = ttk.Frame(shell)
@@ -180,21 +194,27 @@ class UploaderApp:
 
     def _home(self):
         page = self.home_page
-        ttk.Label(page, text="本次更新", style="Section.TLabel").pack(anchor="w")
+        heading = ttk.Frame(page)
+        heading.pack(fill="x")
+        ttk.Label(heading, text="本次更新", style="Section.TLabel").pack(side="left")
+        self._help_button(heading, "workflow", "stages").pack(side="left", padx=(4, 8))
+        ttk.Label(heading, text="01 → 保存审核结果 → 02 → 可选 03", style="Muted.TLabel").pack(side="left")
         directory = ttk.Frame(page)
         directory.pack(fill="x", pady=(6, 10))
         self.input_var = tk.StringVar()
         self.variables[("local", "input_root")] = self.input_var
         self.input_entry = ttk.Entry(directory, textvariable=self.input_var)
         self.input_entry.pack(side="left", fill="x", expand=True)
+        self._help_button(directory, "local", "input_root").pack(side="left", padx=(4, 0))
         ttk.Button(directory, text="选择目录…", command=lambda: self._browse("local", "input_root", "dir")).pack(side="left", padx=(8, 0))
         self.preprocess_button = ttk.Button(directory, text="预处理曲目", command=self.start_preprocess)
         self.preprocess_button.pack(side="left", padx=(8, 0))
-        self.check_button = ttk.Button(directory, text="检查资源", style="Accent.TButton", command=self.start_check)
+        self.check_button = ttk.Button(directory, text="检查资源", command=self.start_check)
         self.check_button.pack(side="left", padx=(8, 0))
         version_row = ttk.Frame(page)
         version_row.pack(fill="x", pady=(0, 10))
         ttk.Label(version_row, text="本次导入 version").pack(side="left")
+        self._help_button(version_row, "import", "version").pack(side="left", padx=(4, 0))
         self.import_version_var = tk.StringVar()
         self.variables[("import", "version")] = self.import_version_var
         ttk.Entry(version_row, textvariable=self.import_version_var, width=18).pack(side="left", padx=8)
@@ -209,29 +229,35 @@ class UploaderApp:
         self.variables[("bundle", "app_version")] = self.manual_app_version_var
         self.follow_app_checkbox = ttk.Checkbutton(app_row, text="沿用当前应用版本", variable=self.follow_app_version_var)
         self.follow_app_checkbox.pack(side="left")
+        self._help_button(app_row, "bundle", "follow_app_version").pack(side="left", padx=(4, 0))
         entry = ttk.Entry(app_row, textvariable=self.auto_app_version_var, width=18, state="disabled")
         entry.pack(side="left", padx=8)
         self.app_version_entries.append(entry)
         ttk.Label(app_row, textvariable=self.bundle_preview, style="Muted.TLabel", wraplength=self.px(420)).pack(side="left")
         stages = ttk.Frame(page)
         stages.pack(fill="x", pady=(0, 10))
-        stages.columnconfigure((0, 1), weight=1)
+        stages.columnconfigure((0, 1, 2), weight=1, uniform="stages")
         self.stage_buttons = []
         for column, title, detail, button in (
-            (0, "01  准备与审核", "整理资源并打开 songlist，人工检查保存。", "准备并审核"),
-            (1, "02  发布更新", "保存审核结果后，打包、上传并刷新。", "发布更新"),
+            (0, "01  准备与审核", "自动预处理、检查并准备资源，打开 songlist 审核。", "准备并审核"),
+            (1, "02  打包与上传", "打包并同步本地、VPS；完成文件核验。", "打包并上传"),
+            (2, "03  服务端操作", "刷新资源、补购买项和定数；可选执行。", "服务端操作"),
         ):
             card = ttk.Frame(stages, style="Card.TFrame", padding=self.px(12))
             card.grid(row=0, column=column, sticky="nsew", padx=(0, 5) if column == 0 else (5, 0))
             ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor="w")
-            ttk.Label(card, text=detail, style="CardMuted.TLabel", wraplength=self.px(340)).pack(anchor="w", pady=(4, 9))
+            description = ttk.Label(card, text=detail, style="CardMuted.TLabel", wraplength=self.px(340))
+            description.pack(fill="x", pady=(4, 9))
+            card.bind("<Configure>", lambda event, label=description: label.configure(
+                wraplength=max(self.px(40), event.width - self.px(24))))
             row = ttk.Frame(card, style="Card.TFrame")
-            row.pack(fill="x")
-            action = ttk.Button(row, text=button, state="disabled")
+            row.pack(side="bottom", fill="x")
+            action = ttk.Button(row, text=button, state="disabled" if column < 2 else "normal",
+                                command=(lambda: self.results.select(self.server_ops.frame)) if column == 2 else None)
             action.pack(side="left")
-            ttk.Label(row, text="待接入", style="CardMuted.TLabel").pack(side="left", padx=10)
+            ttk.Label(row, text="待接入" if column < 2 else "可选", style="CardMuted.TLabel").pack(side="left", padx=6)
             self.stage_buttons.append(action)
-        self.summary = tk.StringVar(value="尚未检查 · 可先将收集的曲目整理为标准副本")
+        self.summary = tk.StringVar(value="辅助操作：预处理曲目 / 检查资源 · 原始目录保持不变")
         ttk.Label(page, textvariable=self.summary, style="Section.TLabel").pack(anchor="w", pady=(0, 6))
         self.progress = ttk.Progressbar(page, mode="indeterminate")
         self.progress.pack(fill="x", pady=(0, 10))
@@ -240,6 +266,8 @@ class UploaderApp:
         toolbar.pack(side="bottom", fill="x", pady=(10, 0))
         self.export_button = ttk.Button(toolbar, text="导出检查报告…", state="disabled", command=self.export_report)
         self.export_button.pack(side="left")
+        self.workspace_button = ttk.Button(toolbar, text="工作区管理…", command=self.manage_workspaces)
+        self.workspace_button.pack(side="left", padx=8)
         ttk.Button(toolbar, text="打开配置页", command=lambda: self.pages.select(self.config_page)).pack(side="right")
         self.results = ttk.Notebook(page)
         self.results.pack(fill="both", expand=True)
@@ -258,7 +286,13 @@ class UploaderApp:
         self.details.tag_configure("error", foreground="#b42318")
         scroll.pack(side="right", fill="y")
         self.details.pack(fill="both", expand=True)
-        self._set_details("检查结果", ["填写配置后点击“检查资源”，查看新增曲目、资源去向及合并冲突。"])
+        from .server_tasks_gui import ServerOperationsPanel
+        self.server_ops = ServerOperationsPanel(self)
+        self._set_details("检查结果", [
+            "预处理和检查是可单独运行的辅助操作；当前预览版尚未接入 01、02。",
+            "接入后可直接执行 01，内部自动预处理、检查并准备资源。审核保存工作区 songlist 后，再执行 02。",
+            "03 可选执行：刷新资源、购买项、人工定数和成绩评分；也支持已手动上传的批次。",
+        ])
 
     def _tree(self, title, columns, headings, widths):
         frame = ttk.Frame(self.results)
@@ -279,7 +313,7 @@ class UploaderApp:
         self.config_page.columnconfigure(0, weight=1)
         self.config_page.rowconfigure(2, weight=1)
         ttk.Label(self.config_page, text="路径和连接设置", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(self.config_page, text="路径可浏览选择；SSH 端口默认为 22。占位谱面留空时，从本地服务端推导。",
+        ttk.Label(self.config_page, text="点击各项旁的 ⓘ 查看用途和填写示例；SSH 传文件，API 刷新资源索引。",
                   style="Muted.TLabel", wraplength=self.px(790)).grid(row=1, column=0, sticky="w", pady=(4, 9))
         body = ttk.Frame(self.config_page)
         body.grid(row=2, column=0, sticky="nsew")
@@ -299,11 +333,16 @@ class UploaderApp:
             row += 1
             for key, label, kind in fields:
                 variable = self.variables.setdefault((section, key), tk.StringVar())
+                label_row = ttk.Frame(self.form)
+                label_row.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
                 if kind == "check":
-                    ttk.Checkbutton(self.form, text=label, variable=variable).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+                    label_row.grid_configure(columnspan=3)
+                    ttk.Checkbutton(label_row, text=label, variable=variable).pack(side="left")
+                    self._help_button(label_row, section, key).pack(side="left", padx=(4, 0))
                     row += 1
                     continue
-                ttk.Label(self.form, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
+                ttk.Label(label_row, text=label).pack(side="left")
+                self._help_button(label_row, section, key).pack(side="left", padx=(4, 0))
                 entry = ttk.Entry(self.form, textvariable=variable)
                 entry.grid(row=row, column=1, sticky="ew", pady=4)
                 if kind == "app_version":
@@ -314,7 +353,7 @@ class UploaderApp:
                 if kind == "app_version":
                     ttk.Label(self.form, textvariable=self.bundle_preview, style="Muted.TLabel", wraplength=self.px(550)).grid(row=row, column=1, columnspan=2, sticky="w", pady=(0, 5))
                     row += 1
-        ttk.Label(self.form, text="Bundler 和图片 / 预览处理已内置。API 填到 /api/v1；Token 填环境变量名。",
+        ttk.Label(self.form, text="Bundler 和图片 / 预览处理已内置。网络配置当前仅保存，预处理和检查无需 API Token。",
                   style="Muted.TLabel", wraplength=self.px(730)).grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 12))
         self.root.bind_all("<MouseWheel>", self._wheel, add="+")
         actions = ttk.Frame(self.config_page)
@@ -322,13 +361,74 @@ class UploaderApp:
         ttk.Button(actions, text="载入配置…", command=self.import_config).pack(side="left")
         ttk.Button(actions, text="另存为…", command=self.save_as).pack(side="left", padx=8)
         ttk.Button(actions, text="背景对应表…", command=self.edit_background_pairs).pack(side="left")
+        self._help_button(actions, "import", "background_pairs").pack(side="left", padx=(4, 0))
         ttk.Button(actions, text="保存配置", style="Accent.TButton", command=self.save).pack(side="right")
         self.config_label = tk.StringVar(value=str(self.config_path))
         ttk.Label(self.config_page, textvariable=self.config_label, style="Muted.TLabel", wraplength=self.px(790)).grid(row=4, column=0, sticky="w")
 
     def _wheel(self, event):
-        if self.pages.select() == str(self.config_page):
+        if event.widget.winfo_toplevel() == self.root and self.pages.select() == str(self.config_page):
             self.config_canvas.yview_scroll(-int(event.delta / 120), "units")
+
+    def _help_button(self, parent, section, key):
+        # A keyboard-focusable button also works where hover tooltips cannot.
+        topic = (section, key)
+        button = ttk.Button(parent, text="ⓘ", width=2, style="Help.TButton", takefocus=True,
+                            cursor="hand2", command=lambda: self.show_help(topic))
+        self.help_buttons.setdefault(topic, []).append(button)
+        return button
+
+    def show_help(self, topic):
+        content = FIELD_HELP[topic]
+        if self.help_window is not None:
+            self.help_window.destroy()
+        previous_focus = self.root.focus_get()
+        window = self.help_window = tk.Toplevel(self.root)
+        window.title(content.title + " · 填写说明")
+        window.transient(self.root)
+        width = min(self.px(640), self.root.winfo_screenwidth() - self.px(40))
+        height = min(self.px(470), self.root.winfo_screenheight() - self.px(80))
+        x = max(0, min(self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2,
+                       self.root.winfo_screenwidth() - width))
+        y = max(0, min(self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2,
+                       self.root.winfo_screenheight() - height - self.px(40)))
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.minsize(min(self.px(420), width), min(self.px(280), height))
+        body = ttk.Frame(window, padding=self.px(16))
+        body.pack(fill="both", expand=True)
+        title = ttk.Label(body, text=content.title, style="Section.TLabel")
+        title.pack(fill="x", pady=(0, self.px(10)))
+        window.bind("<Configure>", lambda event: title.configure(
+            wraplength=max(self.px(40), event.width - self.px(32))) if event.widget == window else None)
+
+        def dismiss():
+            self.help_window = None
+            self.help_text = None
+            window.destroy()
+            if previous_focus is not None and previous_focus.winfo_exists():
+                previous_focus.focus_set()
+
+        footer = ttk.Frame(body)
+        footer.pack(side="bottom", fill="x", pady=(self.px(10), 0))
+        ttk.Button(footer, text="关闭", command=dismiss).pack(side="right")
+        ttk.Label(footer, text="可选中文本复制 · Esc 关闭", style="Muted.TLabel").pack(side="left")
+        reader = ttk.Frame(body)
+        reader.pack(fill="both", expand=True)
+        text = self.help_text = tk.Text(reader, wrap="char", relief="flat", background="#ffffff",
+                                       foreground="#334155", font=("Microsoft YaHei UI", 10),
+                                       padx=self.px(12), pady=self.px(10), width=1, height=1)
+        scroll = ttk.Scrollbar(reader, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        text.tag_configure("heading", font=("Microsoft YaHei UI", 10, "bold"), foreground="#1e293b")
+        text.insert("end", content.description + "\n\n")
+        text.insert("end", "示例\n", "heading")
+        text.insert("end", content.example)
+        text.configure(state="disabled")
+        window.protocol("WM_DELETE_WINDOW", dismiss)
+        window.bind("<Escape>", lambda event: dismiss())
+        text.focus_set()
 
     def _fill(self, values):
         self.settings = deepcopy(values)
@@ -441,8 +541,10 @@ class UploaderApp:
     def start_preprocess(self):
         self._start_job("preprocess")
 
-    def _start_job(self, kind):
+    def _start_job(self, kind, resume_from=None):
         if self.busy:
+            return
+        if not self.server_ops.commit_editor():
             return
         try:
             values = self._collect()
@@ -465,6 +567,7 @@ class UploaderApp:
         self.result_signature = json.dumps(values, sort_keys=True)
         self.check_button.configure(state="disabled")
         self.preprocess_button.configure(state="disabled")
+        self.workspace_button.configure(state="disabled")
         self.export_button.configure(state="disabled")
         for tree in (self.song_tree, self.file_tree):
             tree.delete(*tree.get_children())
@@ -475,14 +578,15 @@ class UploaderApp:
         self.progress.start(12)
         origin = self.config_path.parent
         previous = self.preprocessed if self.preprocessed_signature == self.result_signature else None
-        Thread(target=self._worker, args=(values, origin, kind, previous), daemon=True).start()
+        Thread(target=self._worker, args=(values, origin, kind, previous, resume_from), daemon=True).start()
         self.poll_id = self.root.after(80, self._poll)
 
-    def _worker(self, values, origin, kind, previous):
+    def _worker(self, values, origin, kind, previous, resume_from=None):
         # Only queue plain data. All Tk operations stay on the main thread.
         try:
             if kind == "preprocess":
-                result = preprocess_settings(values, origin, on_diagnostic=lambda entry: self.queue.put(("log", entry)))
+                result = preprocess_settings(values, origin, resume_from=resume_from,
+                                             on_diagnostic=lambda entry: self.queue.put(("log", entry)))
             else:
                 result = inspect_settings(values, origin, previous)
                 for entry in result.get("diagnostics", []):
@@ -511,6 +615,7 @@ class UploaderApp:
         self.progress.stop()
         self.check_button.configure(state="normal")
         self.preprocess_button.configure(state="normal")
+        self.workspace_button.configure(state="normal")
         if not success:
             self.summary.set("检查未完成 · 请查看待处理与提示")
             self._set_details("检查未完成", [])
@@ -530,8 +635,54 @@ class UploaderApp:
         except (ValueError, OSError):
             current = None
         if current != self.result_signature:
+            self.server_ops.context_expired = True
             self._edited()
             self.status.set("检查期间配置已变更，请重新检查。")
+
+    def manage_workspaces(self):
+        if self.workspace_manager is not None:
+            self.workspace_manager.window.lift()
+            self.workspace_manager.refresh()
+            return
+        from .workspace_gui import WorkspaceManager
+        self.workspace_manager = WorkspaceManager(self)
+
+    def resume_workspace(self, batch):
+        if self.busy:
+            return
+        try:
+            values = self._collect()
+            report = load_workspace(values["local"]["release_root"], batch)
+            self.input_var.set(report["input_root"])
+            self.import_version_var.set(report["import_version"])
+        except (ValueError, OSError, KeyError) as exc:
+            messagebox.showerror("无法继续批次", str(exc), parent=self.root)
+            return
+        self.pages.select(self.home_page)
+        self._start_job("preprocess", resume_from=batch)
+
+    def show_workspace_report(self, report):
+        self.preprocessed = self.preprocessed_signature = None
+        self.result, self.result_signature = report, None
+        for tree in (self.song_tree, self.file_tree):
+            tree.delete(*tree.get_children())
+        self._show_preprocess(report)
+        self.server_ops.context_expired = True
+        self.status.set("正在查看历史报告；继续处理后会重新核验，再供本次资源检查使用。")
+        self.pages.select(self.home_page)
+
+    def forget_workspace(self, batch):
+        references = [self.preprocessed or {}, self.result or {}]
+        if not any(r.get("batch_root") == str(batch) or r.get("preprocessing_report") == str(batch / "report.json")
+                   for r in references):
+            return
+        self.preprocessed = self.preprocessed_signature = None
+        self.result = self.result_signature = None
+        self.export_button.configure(state="disabled")
+        for tree in (self.song_tree, self.file_tree):
+            tree.delete(*tree.get_children())
+        self.summary.set("批次已清理 · 请重新预处理或检查")
+        self._set_details("工作区已清理", [str(batch)])
 
     def _set_details(self, title, lines):
         self.log_items = []
@@ -573,6 +724,7 @@ class UploaderApp:
         self.export_button.configure(state="normal")
         self.results.select(2 if plan["errors"] or plan.get("warnings") else 0)
         self.status.set("预检完成，查看 ERROR。" if plan["errors"] else "预检完成，请审核 WARNING；当前未执行发布。")
+        self.server_ops.set_context(plan)
 
     def _show_preprocess(self, report):
         statuses = {"normalized": "已标准化", "blocked": "待人工处理", "ignored": "跳过空谱"}
@@ -588,6 +740,7 @@ class UploaderApp:
         self.export_button.configure(state="normal")
         self.results.select(2 if report["errors"] or report.get("warnings") else 0)
         self.status.set("预处理完成；点击“检查资源”使用本次标准副本，原来源目录保持不变。")
+        self.server_ops.set_context(report)
 
     def export_report(self):
         if self.result is None:
@@ -686,6 +839,7 @@ class UploaderApp:
 
     def close(self):
         self.closed = True
+        self.server_ops.close()
         if self.poll_id:
             self.root.after_cancel(self.poll_id)
         self.root.destroy()

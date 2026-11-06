@@ -50,7 +50,7 @@ class SettingsTests(unittest.TestCase):
         settings["local"]["server_project_root"] = str(self.root / "server")
         resolved = effective_settings(settings, self.root)
         self.assertEqual(resolved["local"]["placeholder_aff"],
-                         str(self.root / "server" / "latest version" / "database" / "songs" / "aletheia" / "0.aff"))
+                         str(self.root / "server" / "latest version" / "database" / "songs" / "sayonarahatsukoi" / "0.aff"))
         self.assertEqual(settings["local"]["placeholder_aff"], "")
 
     def test_legacy_tool_paths_are_retired_without_losing_other_settings(self):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import Counter
 from copy import deepcopy
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,8 @@ from .diagnostics import emit, summarize
 from .import_rules import portable_id, require_version, normalize_import_row, actual_chart_classes
 from .metadata import read_author_metadata, strip_trailing_commas as _strip_trailing_commas
 from .planner import PlanError, check_difficulties, digest, read_json, song_rows
+from .workspaces import (ensure_plain_tree, initialize_workspace, load_workspace,
+                         timestamp, workspace_lock, write_json)
 
 
 METADATA_NAMES = {base + suffix for base in ("songlist", "slst") for suffix in ("", ".json", ".txt")}
@@ -334,8 +337,8 @@ def scan_collection(input_root: Path, *, master: dict | None = None, import_vers
 def preprocess_collection(input_root: Path, output_base: Path, *, master: dict | None = None,
                           ffmpeg_path: str = "", import_version="", assets_root=None, existing_songs=None,
                           background_pairs=None, background_pair_conflicts=None, initialize_background_pairs=True,
-                          on_diagnostic=None) -> dict:
-    """Write a unique batch with songs/, work/ and a report; never overwrite."""
+                          on_diagnostic=None, resume_from: Path | None = None) -> dict:
+    """Create or resume one batch; reuse only hash-verified, unchanged packages."""
     root, output_base = Path(input_root).resolve(strict=True), Path(output_base).resolve()
     if output_base.is_relative_to(root):
         raise PlanError("预处理输出必须放在原始收集目录之外，避免下一次扫描重复导入。")
@@ -343,25 +346,109 @@ def preprocess_collection(input_root: Path, output_base: Path, *, master: dict |
                              existing_songs=existing_songs, background_pairs=background_pairs,
                              background_pair_conflicts=background_pair_conflicts, initialize_background_pairs=initialize_background_pairs,
                              on_diagnostic=on_diagnostic)
-    output_base.mkdir(parents=True, exist_ok=True)
-    batch = Path(mkdtemp(prefix="preprocessed-", dir=output_base))
+    if resume_from is None:
+        output_base.mkdir(parents=True, exist_ok=True)
+        batch = Path(mkdtemp(prefix="preprocessed-", dir=output_base))
+        initialize_workspace(batch, root, import_version)
+    else:
+        previous = load_workspace(output_base, resume_from)
+        if Path(previous["input_root"]).resolve() != root:
+            raise PlanError("继续处理必须使用该批次原来的输入根目录。")
+        batch = Path(resume_from).resolve()
+    context = {"master": master, "import_version": import_version, "assets_root": assets_root,
+               "existing_songs": existing_songs, "background_pairs": background_pairs,
+               "background_pair_conflicts": background_pair_conflicts,
+               "initialize_background_pairs": initialize_background_pairs, "ffmpeg_path": ffmpeg_path}
+    context_hash = _fingerprint(context)
+    with workspace_lock(output_base, batch):
+        previous = load_workspace(output_base, batch) if resume_from is not None else None
+        ensure_plain_tree(batch)
+        if not (batch / "workspace.json").exists():
+            initialize_workspace(batch, root, import_version)
+        return _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_diagnostic)
+
+
+def _fingerprint(data):
+    return sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, allow_nan=False,
+                             default=str).encode("utf-8")).hexdigest()
+
+
+def _package_fingerprint(record):
+    return _fingerprint({key: record.get(key) for key in ("source", "id", "songlist", "actions", "metadata_snapshot")})
+
+
+def _output_manifest(folder):
+    return {path.name: digest(path) for path in sorted(folder.iterdir()) if path.is_file()}
+
+
+def _reusable(record, old, folder, same_context):
+    if (not same_context or record["status"] != "ready" or old.get("status") != "normalized"
+            or old.get("package_fingerprint") != _package_fingerprint(record)
+            or not folder.is_dir() or not old.get("output_sha256")):
+        return False
+    return (all(path.is_file() for path in folder.iterdir())
+            and _output_manifest(folder) == old["output_sha256"])
+
+
+def _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_diagnostic):
     songs = batch / "songs"
-    songs.mkdir()
+    songs.mkdir(exist_ok=True)
     report.update(mode="preprocess", complete=False, valid=False, batch_root=str(batch), normalized_root=str(songs),
-                  report_file=str(batch / "report.json"))
+                  report_file=str(batch / "report.json"), context_sha256=context_hash,
+                  updated_at=timestamp(), resumed=previous is not None)
+
+    reusable = {}
+    if previous:
+        old_records = {p.get("source"): p for p in previous["packages"]}
+        for record in report["packages"]:
+            folder = songs / (record["id"] if portable_id(record["id"]) else "__invalid__")
+            old = old_records.get(record["source"], {})
+            if _reusable(record, old, folder, previous.get("context_sha256") == context_hash):
+                reusable[record["id"]] = old
+        emit(report["diagnostics"], "info", "workspace.resumed",
+             f"继续批次 {batch.name}；可复用 {len(reusable)} 首已核验副本，其余重新处理。", callback=on_diagnostic)
+        # Stale or manually edited copies stay available for inspection but must
+        # not enter the new songs/ set after a changed or removed input package.
+        stale = [path for path in songs.iterdir() if path.name not in reusable]
+        if stale:
+            archive = batch / "work"
+            archive.mkdir(exist_ok=True)
+            archive = Path(mkdtemp(prefix="previous-", dir=archive))
+            for path in stale:
+                destination = archive / path.name
+                if path.resolve().parent != songs or not destination.resolve().is_relative_to(batch):
+                    raise PlanError("旧工作副本路径越界。")
+                path.rename(destination)
+            emit(report["diagnostics"], "warning", "workspace.previous_saved",
+                 f"{len(stale)} 份旧副本未复用，已保留在 {archive}；请核对其中人工编辑。", callback=on_diagnostic)
 
     def write_report():
-        path = Path(report["report_file"])
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-        temporary.replace(path)
+        summarize(report)
+        report["counts"] = dict(Counter(p["status"] for p in report["packages"]))
+        report["updated_at"] = timestamp()
+        write_json(Path(report["report_file"]), report)
 
     write_report()
     for index, record in enumerate(report["packages"]):
         if record["status"] != "ready":
             continue
-        work = batch / "work" / str(index)
-        work.mkdir(parents=True)
+        if record["id"] in reusable:
+            snapshots = [(action["source"], action["source_sha256"]) for action in record["actions"]]
+            if record.get("metadata_snapshot"):
+                snapshots.append((record["metadata_snapshot"]["source"], record["metadata_snapshot"]["sha256"]))
+            if any(digest(Path(source)) != expected for source, expected in snapshots):
+                raise PlanError("继续处理期间源文件发生变化，请重新继续该批次。")
+            record.update(status="normalized", output=str(songs / record["id"]),
+                          package_fingerprint=_package_fingerprint(record),
+                          output_sha256=reusable[record["id"]]["output_sha256"], reused=True)
+            entry = emit(record["diagnostics"], "info", "package.reused", "复用已核验的标准副本，无需再次复制或转码。",
+                         song_id=record["id"], source=record["source"], callback=on_diagnostic)
+            report["diagnostics"].append(entry)
+            write_report()
+            continue
+        work_root = batch / "work"
+        work_root.mkdir(exist_ok=True)
+        work = Path(mkdtemp(prefix=f"{index}-", dir=work_root))
         try:
             metadata_snapshot = record.get("metadata_snapshot")
             if metadata_snapshot and digest(Path(metadata_snapshot["source"])) != metadata_snapshot["sha256"]:
@@ -392,6 +479,8 @@ def preprocess_collection(input_root: Path, output_base: Path, *, master: dict |
             work.rename(target)
             record["output"] = str(target)
             record["status"] = "normalized"
+            record["package_fingerprint"] = _package_fingerprint(record)
+            record["output_sha256"] = _output_manifest(target)
             entry = emit(record["diagnostics"], "info", "package.written", f"标准副本已完成：{target}",
                          song_id=record["id"], source=record["source"], callback=on_diagnostic)
             report["diagnostics"].append(entry)
@@ -402,6 +491,7 @@ def preprocess_collection(input_root: Path, output_base: Path, *, master: dict |
             report["diagnostics"].append(entry)
             # Failed work stays outside songs/ for diagnosis; never delete input.
         summarize(record)
+        write_report()
     summarize(report)
     report["counts"] = dict(Counter(p["status"] for p in report["packages"]))
     report["valid"] = not report["errors"] and bool(report["counts"].get("normalized"))
@@ -410,7 +500,8 @@ def preprocess_collection(input_root: Path, output_base: Path, *, master: dict |
     return report
 
 
-def preprocess_settings(data: dict, origin: Path, *, scan_only: bool = False, on_diagnostic=None) -> dict:
+def preprocess_settings(data: dict, origin: Path, *, scan_only: bool = False, on_diagnostic=None,
+                        resume_from: Path | None = None) -> dict:
     from .settings import effective_settings
     config = effective_settings(data, origin)
     local = config["local"]
@@ -424,8 +515,10 @@ def preprocess_settings(data: dict, origin: Path, *, scan_only: bool = False, on
                "background_pair_conflicts": config["import"]["background_pair_conflicts"],
                "initialize_background_pairs": not config["import"]["background_pairs_initialized"], "on_diagnostic": on_diagnostic}
     if scan_only:
+        if resume_from is not None:
+            raise PlanError("只读扫描不能同时继续工作区。")
         return scan_collection(Path(local["input_root"]), **options)
     if not local["release_root"]:
         raise PlanError("请先在配置页指定发布工作区。")
     return preprocess_collection(Path(local["input_root"]), Path(local["release_root"]),
-                                 ffmpeg_path=local["ffmpeg_path"], **options)
+                                 ffmpeg_path=local["ffmpeg_path"], resume_from=resume_from, **options)

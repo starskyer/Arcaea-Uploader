@@ -3,12 +3,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
 import tkinter as tk
+from tkinter import ttk
 import unittest
 from unittest.mock import patch
 
 from PIL import Image
 
-from arcaea_uploader.gui import UploaderApp
+from arcaea_uploader.gui import FIELDS, UploaderApp
 from arcaea_uploader.settings import default_settings, load_settings, save_settings
 
 
@@ -42,7 +43,7 @@ class GuiTests(unittest.TestCase):
         assets = self.workspace / "active" / "songs"
         assets.mkdir(parents=True)
         (assets / "songlist").write_text('{"songs":[]}', encoding="utf-8")
-        download = self.workspace / "server" / "latest version" / "database" / "songs" / "aletheia"
+        download = self.workspace / "server" / "latest version" / "database" / "songs" / "sayonarahatsukoi"
         download.mkdir(parents=True)
         (download / "0.aff").write_text("placeholder", encoding="utf-8")
         song = self.workspace / "incoming" / "sample"
@@ -188,7 +189,8 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(len(self.app.song_tree.get_children()), 1)
         self.assertGreater(len(self.app.file_tree.get_children()), 0)
         self.assertEqual(str(self.app.export_button["state"]), "normal")
-        self.assertTrue(all(str(button["state"]) == "disabled" for button in self.app.stage_buttons))
+        self.assertTrue(all(str(button["state"]) == "disabled" for button in self.app.stage_buttons[:2]))
+        self.assertEqual(str(self.app.stage_buttons[2]["state"]), "normal")
         report = self.workspace / "report.json"
         with patch("arcaea_uploader.gui.filedialog.asksaveasfilename", return_value=str(report)):
             self.app.export_report()
@@ -275,6 +277,141 @@ class GuiTests(unittest.TestCase):
         license_text = next(w for w in body.winfo_children() if isinstance(w, tk.Text)).get("1.0", "end")
         self.assertIn("Copyright (c) 2024 Lost-MSth", license_text)
         self.assertIn("Permission is hereby granted", license_text)
+
+    def test_every_configuration_help_opens_without_changing_inputs_or_saving(self):
+        before_file = self.config.read_bytes()
+        before_values = {key: var.get() for key, var in self.app.variables.items()}
+        topics = {(section, key) for _, section, fields in FIELDS for key, _, _ in fields}
+        topics.update({("workflow", "stages"), ("import", "background_pairs")})
+        self.assertEqual(set(self.app.help_buttons), topics)
+        for topic in sorted(topics):
+            with self.subTest(topic=topic):
+                self.app.help_buttons[topic][-1].invoke()
+                self.root.update_idletasks()
+                windows = [w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)]
+                self.assertEqual(windows, [self.app.help_window])
+                self.assertEqual(str(self.app.help_text["state"]), "disabled")
+                self.assertIn("示例", self.app.help_text.get("1.0", "end"))
+        self.assertEqual(self.config.read_bytes(), before_file)
+        self.assertEqual({key: var.get() for key, var in self.app.variables.items()}, before_values)
+        self.assertFalse(self.app.busy)
+        self.assertIsNone(self.app.result)
+
+    def test_help_closes_and_reopens_while_retaining_configuration(self):
+        def buttons(parent):
+            for child in parent.winfo_children():
+                if isinstance(child, ttk.Button):
+                    yield child
+                yield from buttons(child)
+
+        self.app.help_buttons[("api", "token_env")][0].invoke()
+        dialog = self.app.help_window
+        close = next(button for button in buttons(dialog) if button["text"] == "关闭")
+        close.invoke()
+        self.assertFalse(dialog.winfo_exists())
+        self.assertIsNone(self.app.help_window)
+        self.app.help_buttons[("local", "input_root")][0].invoke()
+        self.assertIn("待更新曲目目录", self.app.help_window.title())
+        self.assertIn("工作副本", self.app.help_text.get("1.0", "end"))
+
+    def test_workspace_manager_resumes_saved_batch_after_restart(self):
+        from test_preprocess import song_metadata
+        self.make_package()
+        (self.workspace / "incoming/sample/songlist.json").write_text(
+            json.dumps(song_metadata("sample")), encoding="utf-8")
+        self.app.start_preprocess()
+        self.wait_for_check()
+        batch = self.app.result["batch_root"]
+        self.app.close()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = UploaderApp(self.root, self.config)
+        self.assertIsNone(self.app.preprocessed)
+        self.app.workspace_button.invoke()
+        manager = self.app.workspace_manager
+        item = manager.tree.get_children()[0]
+        manager.tree.selection_set(item)
+        manager.select()
+        manager.resume_button.invoke()
+        self.wait_for_check()
+        self.assertTrue(self.app.result["valid"], self.app.result["errors"])
+        self.assertEqual(self.app.result["batch_root"], batch)
+        self.assertTrue(self.app.result["packages"][0]["reused"])
+        self.app.check_button.invoke()
+        self.wait_for_check()
+        self.assertEqual(self.app.result["preprocessing_report"], str(Path(batch) / "report.json"))
+
+    def test_workspace_manual_delete_requires_click_confirmation_and_invalidates_cache(self):
+        from test_preprocess import song_metadata
+        self.make_package()
+        (self.workspace / "incoming/sample/songlist.json").write_text(
+            json.dumps(song_metadata("sample")), encoding="utf-8")
+        self.app.start_preprocess()
+        self.wait_for_check()
+        batch = Path(self.app.result["batch_root"])
+        self.app.workspace_button.invoke()
+        manager = self.app.workspace_manager
+        manager.tree.selection_set(manager.tree.get_children()[0])
+        manager.select()
+        with patch("arcaea_uploader.workspace_gui.messagebox.askyesno", return_value=False):
+            manager.delete_button.invoke()
+        self.assertTrue(batch.exists())
+        with patch("arcaea_uploader.workspace_gui.messagebox.askyesno", return_value=True):
+            manager.delete_button.invoke()
+        self.assertFalse(batch.exists())
+        self.assertIsNone(self.app.preprocessed)
+        self.assertIsNone(self.app.result)
+        self.assertEqual(str(self.app.export_button["state"]), "disabled")
+        self.assertTrue((self.workspace / "incoming/sample/2.aff").exists())
+
+    def prepare_stage03(self):
+        from test_preprocess import song_metadata
+        self.make_package()
+        metadata = song_metadata("sample")
+        (self.workspace / "incoming/sample/songlist.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self.app.start_preprocess()
+        self.wait_for_check()
+        panel = self.app.server_ops
+        self.assertIsNotNone(panel.task, panel.hint.get())
+        self.assertFalse(panel.path.exists(), "Preprocessing should not write a 03 draft implicitly")
+        source = self.workspace / "reviewed-songlist"
+        source.write_text(json.dumps({"songs": [metadata]}), encoding="utf-8")
+        with patch("arcaea_uploader.server_tasks_gui.filedialog.askopenfilename", return_value=str(source)):
+            panel.choose_source()
+        return panel
+
+    def test_stage03_missing_constant_prompt_can_cancel_without_network(self):
+        panel = self.prepare_stage03()
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=False) as prompt:
+            with patch("arcaea_uploader.server_tasks_gui.ApiClient.from_settings") as client:
+                panel.execute()
+                client.assert_not_called()
+        self.assertIn("sample/2", prompt.call_args.args[1])
+        self.assertFalse(self.app.busy)
+
+    def test_inline_constant_is_saved_and_stage03_executes_against_fixture_api(self):
+        from test_server_tasks import FakeAPI
+        from arcaea_uploader.server_tasks import load_task
+        panel = self.prepare_stage03()
+        entry = ttk.Entry(self.root)
+        entry.insert(0, "9.8")
+        panel.editor = (entry, "sample", 2)
+        self.assertTrue(panel.commit_editor())
+        self.assertEqual(load_task(panel.path)["constants"]["sample"]["2"], 9.8)
+        api = FakeAPI()
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=True):
+            with patch("arcaea_uploader.server_tasks_gui.ApiClient.from_settings", return_value=api):
+                panel.execute()
+                self.wait_for_check()
+        self.assertEqual(panel.task["state"], "complete")
+        self.assertEqual(api.songs["sample"]["charts"][2]["chart_const"], 9.8)
+        self.assertEqual(api.songs["sample"]["charts"][0]["chart_const"], -1)
+        before = len(api.writes())
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=True):
+            with patch("arcaea_uploader.server_tasks_gui.ApiClient.from_settings", return_value=api):
+                panel.execute()
+                self.wait_for_check()
+        self.assertEqual(len(api.writes()) - before, 3, "A fresh manual confirmation must refresh uploaded resources again")
 
 
 if __name__ == "__main__":

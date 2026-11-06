@@ -125,7 +125,7 @@ def effective_settings(data: dict, origin: Path) -> dict:
         policy["background_pairs_initialized"] = True
     if not local["placeholder_aff"] and local["server_project_root"]:
         local["placeholder_aff"] = str(Path(local["server_project_root"])
-                                       / local["database_relative_path"] / "songs" / "aletheia" / "0.aff")
+                                       / local["database_relative_path"] / "songs" / "sayonarahatsukoi" / "0.aff")
     return result
 
 

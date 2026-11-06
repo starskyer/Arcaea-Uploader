@@ -21,6 +21,7 @@ def main(argv=None):
     preprocess_parser = commands.add_parser("preprocess", help="Normalize collected chart packages into work copies")
     preprocess_parser.add_argument("--config", required=True, type=Path)
     preprocess_parser.add_argument("--scan-only", action="store_true", help="Report without copying or converting")
+    preprocess_parser.add_argument("--resume", type=Path, help="Continue a previous batch inside the configured release_root")
     args = parser.parse_args(argv)
     if args.smoke_test:
         from .smoke import run_smoke_test
@@ -32,7 +33,8 @@ def main(argv=None):
         if args.command == "preprocess":
             from .preprocess import preprocess_settings
             from .settings import load_settings
-            plan = preprocess_settings(load_settings(args.config), args.config.resolve().parent, scan_only=args.scan_only)
+            plan = preprocess_settings(load_settings(args.config), args.config.resolve().parent,
+                                       scan_only=args.scan_only, resume_from=args.resume)
         else:
             plan = build_plan(resolve_config(args.config))
     except (ValueError, OSError) as exc:

@@ -10,6 +10,9 @@
 # Generated releases, runtime state and resource copies
 /releases/
 /state/
+.server-tasks/
+/.locks/
+/.history/
 /logs/
 /assets/
 /database/
