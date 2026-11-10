@@ -30,7 +30,14 @@ def collect_notices(application):
 
     copy(Path(sys.base_prefix) / "LICENSE.txt", "Python", platform.python_version(), "Python.txt")
     for package in ("Pillow", "PyInstaller", "paramiko", "bcrypt", "cryptography", "cffi", "pycparser", "pynacl", "invoke", "typing_extensions"):
-        distribution = metadata.distribution(package)
+        try:
+            distribution = metadata.distribution(package)
+        except metadata.PackageNotFoundError:
+            # Recent Python/dependency combinations no longer need this
+            # compatibility package. Only collect it when it is installed.
+            if package == "typing_extensions":
+                continue
+            raise
         matches = [f for f in distribution.files or []
                    if f.name.lower().startswith(("license", "copying", "notice"))]
         if not matches:
