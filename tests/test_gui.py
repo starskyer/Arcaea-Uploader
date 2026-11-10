@@ -739,6 +739,27 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(panel.tree.set("sample", "2"), text)
                 self.assertEqual(missing_constants(panel.task), [])
 
+    def test_purchase_review_stays_visible_on_a_768_pixel_display(self):
+        self.app.close()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.tk.call("tk", "scaling", 96 / 72)
+        with patch.object(self.root, "winfo_screenheight", return_value=768), patch.object(
+                self.root, "winfo_screenwidth", return_value=1024):
+            self.app = UploaderApp(self.root, self.config)
+        panel = self.prepare_stage03()
+        self.root.deiconify()
+        self.app.results.select(panel.frame)
+        panel.review_tabs.select(panel.purchase_frame)
+        self.root.update()
+        row = panel.purchase_tree.get_children()[0]
+        self.assertTrue(panel.purchase_tree.bbox(row), "Small displays must retain a visible purchase row")
+        self.assertFalse(self.app.update_controls.winfo_manager())
+        self.app.results.select(self.app.song_tree.master)
+        self.root.update()
+        self.assertEqual(self.app.update_controls.winfo_manager(), "pack",
+                         "Returning to song review must restore the setup actions")
+
     def test_inline_constant_is_saved_and_stage03_executes_against_fixture_api(self):
         from test_server_tasks import FakeAPI
         from arcaea_uploader.server_tasks import load_task

@@ -285,7 +285,8 @@ class UploaderApp:
         ttk.Label(footer, textvariable=self.status, style="Muted.TLabel", wraplength=self.px(850)).pack(anchor="w")
 
     def _home(self):
-        page = self.home_page
+        page = self.update_controls = ttk.Frame(self.home_page)
+        page.pack(fill="x")
         heading = ttk.Frame(page)
         heading.pack(fill="x")
         ttk.Label(heading, text="本次更新", style="Section.TLabel").pack(side="left")
@@ -349,8 +350,10 @@ class UploaderApp:
             action.pack(side="left")
             ttk.Label(row, text="审核后执行" if column == 1 else "API 可选" if column == 2 else "", style="CardMuted.TLabel").pack(side="left", padx=6)
             self.stage_buttons.append(action)
+        page = self.home_page
         self.summary = tk.StringVar(value="辅助操作：预处理曲目 / 检查资源 · 原始目录保持不变")
-        ttk.Label(page, textvariable=self.summary, style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        self.update_summary = ttk.Label(page, textvariable=self.summary, style="Section.TLabel")
+        self.update_summary.pack(anchor="w", pady=(0, 6))
         self.progress = ttk.Progressbar(page, mode="indeterminate")
         self.progress.pack(fill="x", pady=(0, 10))
         # Reserve the footer before allocating the expandable results area.
@@ -382,11 +385,24 @@ class UploaderApp:
         self.details.pack(fill="both", expand=True)
         from .server_tasks_gui import ServerOperationsPanel
         self.server_ops = ServerOperationsPanel(self)
+        self.results.bind("<<NotebookTabChanged>>", self._layout_update_controls)
+        self.home_page.bind("<Configure>", self._layout_update_controls)
         self._set_details("检查结果", [
             "可直接执行 01，内部自动预处理、检查并准备资源；预处理和检查按钮是辅助入口。",
             "审核保存工作区 songlist 后执行 02；新增曲包和解锁条件须手动补充 packlist / unlocks。",
             "03 可选执行：刷新资源、购买项、人工定数和成绩评分；也支持已手动上传的批次。",
         ])
+
+    def _layout_update_controls(self, event=None):
+        """Keep stage 03 usable when a display cannot fit both setup and review."""
+        if self.home_page.winfo_height() <= 1:
+            return
+        compact = (self.results.select() == str(self.server_ops.frame)
+                   and self.home_page.winfo_height() < self.update_controls.winfo_reqheight() + self.px(450))
+        if compact and self.update_controls.winfo_manager():
+            self.update_controls.pack_forget()
+        elif not compact and not self.update_controls.winfo_manager():
+            self.update_controls.pack(fill="x", before=self.update_summary)
 
     def _tree(self, title, columns, headings, widths):
         frame = ttk.Frame(self.results)
