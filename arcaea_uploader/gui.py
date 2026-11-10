@@ -20,7 +20,7 @@ from .planner import build_plan, resolve_config
 from .preprocess import preprocess_settings
 from .import_rules import require_version
 from .backgrounds import normalize_pairs, pair_lookup
-from .diagnostics import summarize
+from .diagnostics import emit, summarize
 from .field_help import FIELD_HELP
 from .workspaces import load_workspace, workspace_settings
 from .workspace_session import entries as session_entries, load_session, remember
@@ -28,6 +28,7 @@ from .bundle_versions import latest_record, read_history, resolve_bundle_version
 from .settings import (
     default_config_path, default_settings, effective_settings, load_settings,
     normalize_settings, save_settings,
+    remember_background_pairs, persist_background_pairs,
 )
 
 
@@ -55,6 +56,7 @@ FIELDS = (
     ("服务端管理 API", "api", (
         ("base_url", "管理 API 地址", "text"),
         ("token_env", "Token 环境变量名", "text"),
+        ("use_system_proxy", "API 使用系统代理", "check"),
     )),
     ("工具与目录细节", "local", (
         ("database_relative_path", "本地 database 相对路径", "text"),
@@ -128,7 +130,7 @@ class UploaderApp:
         # Font and theme metrics vary by DPI; retain room for the result rows.
         self.root.update_idletasks()
         min_width, min_height = self.root.minsize()
-        required = self.root.winfo_reqheight() - self.results.winfo_reqheight() + self.px(220)
+        required = self.root.winfo_reqheight() - self.results.winfo_reqheight() + self.px(400)
         self.root.minsize(min_width, min(max(min_height, required),
                                         self.root.winfo_screenheight() - self.px(80)))
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -424,7 +426,7 @@ class UploaderApp:
             ttk.Label(self.form, text=title, style="Section.TLabel").grid(row=row, column=0, columnspan=3, sticky="w", pady=(12 if row else 0, 6))
             row += 1
             for key, label, kind in fields:
-                variable = self.variables.setdefault((section, key), tk.StringVar())
+                variable = self.variables.setdefault((section, key), tk.BooleanVar() if kind == "check" else tk.StringVar())
                 label_row = ttk.Frame(self.form)
                 label_row.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
                 if kind == "check":
@@ -855,6 +857,7 @@ class UploaderApp:
             self.results.select(2)
             self.status.set("请检查路径和资源后重试。")
             return
+        self._remember_background_pairs(value)
         self.result = value
         if self.job_kind == "preprocess":
             self.preprocessed = value
@@ -898,6 +901,33 @@ class UploaderApp:
             self._edited()
             self.status.set("检查期间配置已变更，请重新检查。")
 
+    def _remember_background_pairs(self, report):
+        additions = report.get("learned_background_pairs", {})
+        if not report.get("valid") or not additions or self.job_kind not in {"prepare", "preprocess"}:
+            return
+        try:
+            current = self._collect()
+            if json.dumps(current, sort_keys=True) != self.result_signature:
+                emit(report["diagnostics"], "warning", "background.memory_deferred",
+                     "处理期间配置已改变，暂未自动保存背景配对；请恢复工作区后重新执行 01。")
+                summarize(report)
+                return
+            saved, conflicts = persist_background_pairs(self.config_path, additions)
+            remember_background_pairs(current["import"], additions)
+            self.settings["import"] = current["import"]
+            # Learning is an expected configuration change, not an expired job.
+            self.result_signature = json.dumps(self._collect(), sort_keys=True)
+            for left, right in saved.items():
+                emit(report["diagnostics"], "info", "background.pair_remembered",
+                     f"已将新背景配对 {left} ↔ {right} 自动记入本地配置，后续可双向推导。")
+            if conflicts:
+                emit(report["diagnostics"], "warning", "background.memory_conflict",
+                     f"本地已保存的背景配对存在冲突，保留原记录，请在对应表中确认：{conflicts}。")
+        except (ValueError, OSError) as error:
+            emit(report["diagnostics"], "warning", "background.memory_failed",
+                 f"资源已准备，但自动保存背景配对失败：{error}；工作区内仍保留配对。")
+        summarize(report)
+
     def manage_workspaces(self):
         if self.workspace_manager is not None:
             self.workspace_manager.window.lift()
@@ -916,9 +946,7 @@ class UploaderApp:
             values = workspace_settings(batch.parent, batch, self._collect(), self.config_path.parent)
             self._fill(values)
             self.remember_workspace(batch)
-            report = load_workspace(batch.parent, batch)
-            self.input_var.set(report["input_root"])
-            self.import_version_var.set(report["import_version"])
+            load_workspace(batch.parent, batch)
             if (Path(batch) / "publish.json").is_file():
                 from .publishing import load_preparation
                 from .planner import read_json
@@ -997,7 +1025,7 @@ class UploaderApp:
         self.result = {"mode": "committed", "batch_id": batch.name, "history_file": str(history)}
         self.remember_workspace()
         self.summary.set("工作区已提交 · 临时内容已清理")
-        self.status.set("保留完成摘要与 03 任务归档；可以开始新的工作区。")
+        self.status.set("完成摘要与 03 归档只读保留；可创建后续 03 任务，或开始新的工作区。")
         if self.workspace_manager:
             self.workspace_manager.refresh()
 
@@ -1045,7 +1073,8 @@ class UploaderApp:
 
     def _show_preprocess(self, report):
         statuses = {"normalized": "已标准化", "blocked": "待人工处理", "ignored": "跳过空谱"}
-        actions = {"copy": "复制", "thumbnail": "生成缩略图", "transcode": "音频转码"}
+        actions = {"copy": "复制", "thumbnail": "生成缩略图", "transcode": "音频转码",
+                   "image": "整理 JPEG 曲绘", "background": "整理背景尺寸与格式"}
         for package in report["packages"]:
             sid = package["id"] or Path(package["source"]).name
             self.song_tree.insert("", "end", values=(sid, statuses.get(package["status"], package["status"]), "—"))

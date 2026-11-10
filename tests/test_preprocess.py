@@ -80,6 +80,9 @@ class PreprocessTests(unittest.TestCase):
         self.assertFalse((output / "Arcade").exists())
         self.assertFalse((output / "3.aff").exists())
         self.assertTrue((output / "songlist").is_file())
+        keys = list(json.loads((output / "songlist").read_text(encoding="utf-8"))["songs"][0])
+        self.assertEqual(keys[keys.index("date"):keys.index("date") + 3], ["date", "version", "remote_dl"])
+        self.assertEqual(keys[keys.index("bg") + 1], "bg_inverse")
         self.assertEqual(load_package(output)[0]["id"], "example")
         with Image.open(output / "base_256.jpg") as image:
             self.assertEqual(image.size, (384, 384))
@@ -309,3 +312,32 @@ class PreprocessTests(unittest.TestCase):
         self.assertFalse((output / "base.wav").exists())
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(load_package(output)[0]["id"], "example")
+
+    def test_cli_only_remembers_explicit_pairs_after_successful_materialization(self):
+        row = song_metadata()
+        row.update(bg="new_day", bg_inverse="new_night")
+        folder = self.package(metadata=row)
+        for name in ("new_day", "new_night"):
+            Image.new("RGB", (330, 250)).save(folder / (name + ".png"))
+        config = self.root / "config.json"
+        config.write_text(json.dumps({"import": {"version": "7.0"}, "local": {
+            "input_root": str(self.incoming), "release_root": str(self.output)}}), encoding="utf-8")
+        command = [sys.executable, "-m", "arcaea_uploader", "preprocess", "--config", str(config)]
+        before = config.read_bytes()
+        result = subprocess.run([*command, "--scan-only"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(config.read_bytes(), before)
+        self.assertFalse(self.output.exists())
+        bad = self.incoming / "bad"
+        bad.mkdir()
+        (bad / "2.aff").write_bytes(PLAYABLE)
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(config.read_bytes(), before, "An invalid batch must not remember candidate pairs")
+        (bad / "2.aff").unlink()
+        bad.rmdir()
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        self.assertEqual(saved["import"]["background_pairs"], {"new_day": "new_night"})
+        self.assertTrue(any(d["code"] == "background.pair_remembered" for d in json.loads(result.stdout)["diagnostics"]))

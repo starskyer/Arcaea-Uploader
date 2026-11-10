@@ -136,7 +136,7 @@ class ImportDecisionsTests(unittest.TestCase):
         self.assertFalse(any(p.suffix == ".wav" for p in files))
         self.assertTrue(any(d["level"] == "warning" for d in diagnostics))
 
-    def test_png_bytes_under_jpg_suffix_are_copied_without_encoding_diagnostic(self):
+    def test_png_bytes_under_jpg_suffix_become_real_jpeg_without_changing_sources(self):
         folder = self.package()
         for name in ("base.jpg", "base_256.jpg"):
             Image.new("RGBA", (384, 384), (0, 0, 255, 120)).save(folder / name, format="PNG")
@@ -145,8 +145,9 @@ class ImportDecisionsTests(unittest.TestCase):
         output = Path(report["normalized_root"]) / "example"
         self.assertTrue(report["valid"], report["errors"])
         for name, raw in original.items():
-            self.assertEqual((output / name).read_bytes(), raw)
-        self.assertFalse(any("编码" in d["message"] or "PNG" in d["message"] for d in report["diagnostics"]))
+            self.assertEqual((folder / name).read_bytes(), raw)
+            with Image.open(output / name) as image:
+                self.assertEqual((image.format, image.mode), ("JPEG", "RGB"))
 
     def test_existing_background_is_skipped_before_size_or_encoding_read(self):
         folder = self.package()
@@ -157,7 +158,7 @@ class ImportDecisionsTests(unittest.TestCase):
         self.assertFalse((Path(report["normalized_root"]) / "example/custom.jpg").exists())
         self.assertTrue(any(d["code"] == "background.skip_existing" and d["level"] == "info" for d in report["diagnostics"]))
 
-    def test_new_1920x1440_background_routes_to_1080_but_1920x1200_errors(self):
+    def test_nonstandard_background_is_resized_to_hd_without_changing_source(self):
         folder = self.package()
         image = folder / "custom.jpg"
         Image.new("RGB", (1920, 1440)).save(image)
@@ -166,9 +167,54 @@ class ImportDecisionsTests(unittest.TestCase):
         action = next(a for a in report["packages"][0]["actions"] if a["target"] == "custom.jpg")
         self.assertEqual(action["background_target"], "img/bg/1080/custom.jpg")
         Image.new("RGB", (1920, 1200)).save(image)
+        original = image.read_bytes()
+        report = self.process()
+        self.assertTrue(report["valid"], report["errors"])
+        with Image.open(Path(report["normalized_root"]) / "example/custom.jpg") as resized:
+            self.assertEqual((resized.size, resized.format), ((1920, 1440), "JPEG"))
+        self.assertEqual(image.read_bytes(), original)
+        self.assertTrue(any(d["code"] == "background.resize" and d["level"] == "info" for d in report["diagnostics"]))
+
+    def test_only_png_base_supplies_both_jpeg_jackets_and_preserves_original(self):
+        folder = self.package()
+        for name in ("base.jpg", "base_256.jpg"):
+            (folder / name).unlink()
+        source = folder / "base.png"
+        Image.new("RGBA", (640, 500), (0, 0, 255, 0)).save(source)
+        original = source.read_bytes()
+        report = self.process()
+        self.assertTrue(report["valid"], report["errors"])
+        output = Path(report["normalized_root"]) / "example"
+        for name, size in (("base.jpg", (640, 500)), ("base_256.jpg", (384, 384))):
+            with Image.open(output / name) as image:
+                self.assertEqual((image.format, image.size, image.mode), ("JPEG", size, "RGB"))
+                self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_explicit_pair_requires_both_supplied_images_and_does_not_learn_inference(self):
+        row = song_metadata()
+        row.update(bg="new_light", bg_inverse="new_conflict")
+        folder = self.package(row=row)
+        Image.new("RGB", (300, 200)).save(folder / "new_light.png")
+        self.assertEqual(self.scan()["learned_background_pairs"], {})
+        Image.new("RGB", (400, 300)).save(folder / "new_conflict.png")
         report = self.scan()
-        self.assertFalse(report["valid"])
-        self.assertTrue(any("1920×1200" in d["message"] and d["level"] == "error" for d in report["diagnostics"]))
+        self.assertEqual(report["learned_background_pairs"], {"new_light": "new_conflict"})
+        self.assertTrue(any(d["code"] == "background.pair_discovered" and d["level"] == "info" for d in report["diagnostics"]))
+        row.pop("bg_inverse")
+        (folder / "songlist").write_text(json.dumps(row), encoding="utf-8")
+        self.assertEqual(self.scan()["learned_background_pairs"], {})
+
+    def test_input_pair_cannot_replace_an_existing_background_partner(self):
+        row = song_metadata()
+        row.update(bg="new_light", bg_inverse="new_conflict")
+        folder = self.package(row=row)
+        for name in ("new_light", "new_conflict"):
+            Image.new("RGB", (400, 300)).save(folder / (name + ".png"))
+        report = self.scan(background_pairs={"new_light": "confirmed"})
+        self.assertTrue(report["valid"], report["errors"])
+        self.assertEqual(report["learned_background_pairs"], {})
+        self.assertTrue(any(d["code"] == "background.pair_conflict" for d in report["diagnostics"]))
 
     def test_background_missing_reference_warns_without_blocking(self):
         row = song_metadata()

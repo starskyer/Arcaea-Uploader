@@ -28,11 +28,16 @@ def fingerprint(data):
 
 
 def completion_signature(task):
-    return fingerprint({key: task.get(key) for key in
-        ("songs", "actual", "constants", "options", "source", "publication", "endpoint")})
+    values = {key: task.get(key) for key in
+        ("songs", "actual", "constants", "options", "source", "publication", "endpoint")}
+    for key in ("purchase_overrides", "purchase_skip_confirmation", "followup"):
+        if task.get(key):
+            values[key] = task[key]
+    return fingerprint(values)
 
 
 def finish_task(task, *, skipped=False):
+    _editable(task)
     if skipped and any(task["options"].values()):
         raise PlanError("仍有启用的 03 操作，不能标记全部跳过。")
     task["state"] = "skipped" if skipped else "complete"
@@ -45,6 +50,31 @@ def task_complete(task):
             and (task["state"] != "skipped" or not any(task["options"].values())))
 
 
+def archive_info(task, path=None):
+    """Recognize explicit archives and legacy workspace commit records."""
+    if task.get("archive"):
+        return task["archive"]
+    if path is not None:
+        path = Path(path).resolve()
+        if path.parent.name == ".server-tasks" and path.name == task.get("id", "") + ".json":
+            history = path.parent.parent / ".history" / path.name
+            if history.is_file():
+                if linked(history):
+                    raise PlanError("提交记录不能是链接。")
+                record = read_json(history)
+                if record.get("committed") is True and record.get("batch_id") == task["id"]:
+                    return {"kind": "workspace_commit", "completed_at": record.get("completed_at"),
+                            "history_file": str(history), "api_base_url": task.get("endpoint", ""),
+                            "modified_after_commit": bool(record.get("completion_signature")
+                                and record["completion_signature"] != completion_signature(task))}
+    return None
+
+
+def _editable(task, path=None):
+    if archive_info(task, path):
+        raise PlanError("已归档的 03 任务只读；请先创建后续任务，再修改或执行。")
+
+
 def english_name(row):
     localized = row.get("title_localized")
     value = localized.get("en") if isinstance(localized, dict) else None
@@ -54,15 +84,16 @@ def english_name(row):
 def parse_constant(value):
     if value is None or isinstance(value, str) and not value.strip():
         return None
-    if isinstance(value, bool) or not re.fullmatch(r"\d+(?:\.\d)?", str(value).strip()):
-        raise PlanError("定数须为整数或一位小数，未知请留空。")
+    if isinstance(value, bool) or not re.fullmatch(r"-?\d+(?:\.\d)?", str(value).strip()):
+        raise PlanError("定数须为整数或一位小数；可填正数、0 或 -1，未知请留空。")
     try:
         number = Decimal(str(value).strip())
     except InvalidOperation:
         raise PlanError("定数格式无效。") from None
-    if not number.is_finite() or number <= 0 or not math.isfinite(float(number)):
-        raise PlanError("定数须为正数，未知请留空；无实际谱面的难度由程序写 -1。")
-    return float(number)
+    if (not number.is_finite() or number < 0 and number != -1
+            or not math.isfinite(float(number))):
+        raise PlanError("定数可填正数、0 或 -1；0 / -1 不计评分，未知请留空。")
+    return 0.0 if number == 0 else float(number)
 
 
 def _rows(document):
@@ -93,11 +124,12 @@ def make_task(task_id, document, actual, previous=None):
             "created_at": timestamp(), "songs": selected,
             "actual": {sid: sorted(set(classes)) for sid, classes in actual.items()},
             "constants": {}, "options": OPTIONS.copy(), "progress": {}, "managed_purchases": {},
+            "purchase_overrides": {}, "purchase_skip_confirmation": None,
             "state": "draft", "source": None, "publication": None, "revision": 0, "input_errors": []}
     if previous:
         if previous.get("id") != task_id:
             raise PlanError("03 任务标识不匹配。")
-        for key in ("created_at", "constants", "options", "progress", "managed_purchases", "endpoint", "revision", "input_errors", "completion_signature"):
+        for key in ("created_at", "constants", "options", "progress", "managed_purchases", "endpoint", "revision", "input_errors", "completion_signature", "purchase_overrides", "purchase_skip_confirmation", "archive", "followup"):
             if key in previous:
                 task[key] = deepcopy(previous[key])
         if selected == previous["songs"] and task["actual"] == previous["actual"]:
@@ -106,6 +138,7 @@ def make_task(task_id, document, actual, previous=None):
     # A removed difficulty must not leave a writable constant behind.
     task["constants"] = {sid: {str(c): task["constants"].get(sid, {}).get(str(c)) for c in classes}
                          for sid, classes in task["actual"].items()}
+    task["purchase_overrides"] = {sid: value for sid, value in task["purchase_overrides"].items() if sid in actual}
     update_purchase_candidates(task)
     return task
 
@@ -167,6 +200,7 @@ def save_task(path, task, *, locked=False, workspace_locked=False):
     if task.get("owner") != "Arcaea-Uploader/server-task":
         raise PlanError("不是有效的 03 任务。")
     path = Path(path)
+    _editable(task, path)
     if path.parent.exists() and linked(path.parent):
         raise PlanError("03 任务目录不能是链接或目录联接。")
     if not locked:
@@ -181,6 +215,7 @@ def save_task(path, task, *, locked=False, workspace_locked=False):
         task["state"] = "draft"
     if path.exists():
         current = read_json(path)
+        _editable(current, path)
         if (current.get("owner") != task["owner"] or current.get("id") != task["id"]
                 or current.get("revision", 0) != task.get("revision", 0)):
             raise PlanError("03 任务已在其他窗口更新，请重新载入。")
@@ -202,6 +237,22 @@ def load_task(path):
             or not isinstance(task.get("input_errors", []), list)
             or type(task.get("revision", 0)) is not int):
         raise PlanError("03 任务的数据结构无效。")
+    if (not isinstance(task.get("purchase_overrides", {}), dict)
+            or task.get("purchase_skip_confirmation") is not None and not re.fullmatch(
+                r"[0-9a-f]{64}", str(task["purchase_skip_confirmation"]))):
+        raise PlanError("购买项审核记录无效。")
+    for key in ("archive", "followup"):
+        if key in task and (not isinstance(task[key], dict) or not task[key]):
+            raise PlanError("03 归档或后续任务记录无效。")
+    followup = task.get("followup")
+    if followup and (any(not isinstance(followup.get(key), str)
+                        or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", followup[key])
+                        for key in ("source_task_id", "origin_task_id"))
+                     or not isinstance(followup.get("source_task_file"), str) or not followup["source_task_file"]
+                     or not re.fullmatch(r"[0-9a-f]{64}", str(followup.get("source_task_sha256", "")))):
+        raise PlanError("后续任务缺少有效的来源归档记录。")
+    for override in task.get("purchase_overrides", {}).values():
+        _validate_purchase_override(override)
     source = task.get("source")
     if source is not None and (not isinstance(source, dict) or not isinstance(source.get("path"), str)
                                or not re.fullmatch(r"[0-9a-f]{64}", str(source.get("sha256", "")))):
@@ -214,10 +265,68 @@ def load_task(path):
     if (set(validated["options"]) != set(OPTIONS)
             or any(type(v) is not bool for v in validated["options"].values())):
         raise PlanError("03 操作选项无效。")
+    archived = archive_info(validated, path)
+    if archived:
+        validated["archive"] = deepcopy(archived)
     return validated
 
 
+def create_followup(source_path, release_root):
+    """Create a separate metadata task; never mutate the source archive."""
+    source_path = Path(source_path)
+    if linked(source_path):
+        raise PlanError("03 任务文件不能是链接。")
+    source_path = source_path.resolve()
+    with task_lock(source_path):
+        original = load_task(source_path)
+        if not archive_info(original, source_path):
+            raise PlanError("请先完成并归档当前任务，再创建后续任务。")
+        if not original.get("source") or not original.get("publication"):
+            raise PlanError("归档缺少原上传确认，无法建立后续任务。")
+        identifier = "followup-" + original["id"][:50] + "-" + uuid4().hex
+        task = make_task(identifier, {"songs": original["songs"]}, original["actual"])
+        for key in ("constants", "purchase_overrides", "source", "publication", "endpoint"):
+            if key in original:
+                task[key] = deepcopy(original[key])
+        target = original.get("endpoint") or original["archive"].get("api_base_url")
+        if target:
+            task["endpoint"] = target
+        task["options"] = {**original["options"], "refresh_resources": False}
+        task["progress"] = {key: deepcopy(value) for key, value in original["progress"].items()
+                            if key.startswith(("constants:", "purchase:")) or key == "refresh:" + RATING_OPERATION}
+        task["followup"] = {"source_task_id": original["id"], "source_task_file": str(source_path),
+                            "source_task_sha256": digest(source_path),
+                            "origin_task_id": original.get("followup", {}).get("origin_task_id", original["id"])}
+        path = task_path(release_root, identifier)
+        save_task(path, task)
+    return path, task
+
+
+def archive_followup(path, task, *, locked=False):
+    """Freeze a successful follow-up as its own immutable completion record."""
+    path = Path(path)
+    if not locked:
+        with task_lock(path):
+            return archive_followup(path, task, locked=True)
+    _editable(task, path)
+    if not task.get("followup") or not task_complete(task):
+        raise PlanError("后续任务尚未完成，不能归档。")
+    current = read_json(path)
+    _editable(current, path)
+    if current.get("id") != task["id"] or current.get("revision") != task["revision"]:
+        raise PlanError("后续任务已在其他窗口改变，请重新载入。")
+    archived = {**task, "archive": {"kind": "followup_complete", "completed_at": timestamp(),
+                                   "api_base_url": task.get("endpoint", "")},
+                "revision": task["revision"] + 1, "updated_at": timestamp()}
+    write_json(path, archived)
+    task.update(archived)
+    return task
+
+
 def read_reviewed(task, source):
+    _editable(task)
+    if task.get("followup"):
+        raise PlanError("后续任务沿用原归档的曲目元数据，不能更换资源总表。")
     path = Path(source).resolve(strict=True)
     before = digest(path)
     updated = make_task(task["id"], read_json(path), task["actual"], task)
@@ -230,6 +339,7 @@ def read_reviewed(task, source):
 
 
 def confirm_uploaded(task, receipt=None):
+    _editable(task)
     if not task.get("source"):
         raise PlanError("请先载入已经审核并用于上传的最终 songlist。")
     if receipt is not None:
@@ -249,47 +359,168 @@ def missing_constants(task):
             if parse_constant(task["constants"].get(sid, {}).get(str(c))) is None]
 
 
-def purchase_specs(task):
-    specs = {}
-    for row in task["songs"]:
-        name, sid = row.get("purchase", ""), row["id"]
-        if name in ("", None):
-            continue
-        if not portable_id(name):
-            raise PlanError(f"{sid}: purchase ID 不合法。")
-        if name == sid and name == row.get("set"):
-            raise PlanError(f"{sid}: purchase 同时匹配 id 和 set，无法自动决定单曲还是曲包。")
-        if name == sid:
-            kind, price = "single", 100
-        elif name == row.get("set"):
-            kind, price = "pack", 500
+def _purchase_spec(row):
+    name, sid = row.get("purchase", ""), row["id"]
+    if name in ("", None):
+        return None
+    if not portable_id(name):
+        raise PlanError(f"{sid}: purchase ID 不合法。")
+    if name == sid and name == row.get("set"):
+        raise PlanError(f"{sid}: purchase 同时匹配 id 和 set，无法自动决定单曲还是曲包。")
+    if name == sid:
+        kind, price = "single", 100
+    elif name == row.get("set"):
+        kind, price = "pack", 500
+    else:
+        raise PlanError(f"{sid}: purchase 与曲目 ID、set 均不相同，无法自动推断；可编辑本批安排或确认跳过。")
+    return {"kind": kind, "name": name, "price": price, "orig_price": price,
+            "discount_from": PAST_FROM, "discount_to": PAST_TO, "discount_reason": ""}
+
+
+def _validate_purchase_override(value):
+    if not isinstance(value, dict) or value.get("mode") not in {"skip", "custom"}:
+        raise PlanError("购买项编辑模式无效。")
+    if value["mode"] == "custom":
+        if not portable_id(value.get("name")) or value.get("kind") not in {"single", "pack"}:
+            raise PlanError("请填写有效的购买项 ID，并选择单曲或曲包。")
+        price = value.get("price")
+        if type(price) is not int or not 0 <= price <= 2147483647:
+            raise PlanError("购买价格须为非负整数。")
+
+
+def set_purchase_override(task, song_ids, mode, *, name="", kind="single", price=None):
+    """Edit this task only; the reviewed songlist and remote data stay intact."""
+    _editable(task)
+    if mode not in {"auto", "skip", "custom"} or not song_ids:
+        raise PlanError("请选择购买项编辑方式。")
+    if any(sid not in task["actual"] for sid in song_ids):
+        raise PlanError("购买项引用了本批以外的曲目。")
+    value = {"mode": mode}
+    if mode == "custom":
+        if not isinstance(name, str):
+            raise PlanError("购买项 ID 必须是文本。")
+        if isinstance(price, str) and re.fullmatch(r"[0-9]+", price.strip()):
+            price = int(price.strip())
+        value.update(name=name.strip(), kind=kind, price=price)
+    if mode != "auto":
+        _validate_purchase_override(value)
+    previous = deepcopy(task.get("purchase_overrides", {}))
+    overrides = task.setdefault("purchase_overrides", {})
+    for sid in song_ids:
+        if mode == "auto":
+            overrides.pop(sid, None)
         else:
-            raise PlanError(f"{sid}: purchase 必须等于曲目 ID 或 set。")
-        spec = {"kind": kind, "name": name, "price": price, "orig_price": price,
-                "discount_from": PAST_FROM, "discount_to": PAST_TO, "discount_reason": ""}
-        if name in specs and specs[name] != spec:
-            raise PlanError(f"购买项 {name} 在本批同时被解释为不同类别。")
-        specs[name] = spec
-    return list(specs.values())
+            overrides[sid] = deepcopy(value)
+    if overrides != previous:
+        task["purchase_skip_confirmation"] = None
+    update_purchase_candidates(task)
+
+
+def analyze_purchases(task):
+    """A joined catalog view of purchase, item and purchase_item, without I/O."""
+    groups, free, invalid, skipped, errors, conflicts = {}, [], [], [], [], set()
+    for row in task["songs"]:
+        song = {"id": row["id"], "title": english_name(row), "set": row.get("set"),
+                "purchase": row.get("purchase")}
+        try:
+            override = task.get("purchase_overrides", {}).get(row["id"])
+            if override:
+                _validate_purchase_override(override)
+                if override["mode"] == "skip":
+                    skipped.append({**song, "reason": "人工选择跳过购买项"})
+                    continue
+                spec = {key: override[key] for key in ("name", "kind", "price")}
+                spec.update(orig_price=spec["price"], discount_from=PAST_FROM, discount_to=PAST_TO, discount_reason="")
+            else:
+                spec = _purchase_spec(row)
+        except PlanError as error:
+            invalid.append({**song, "error": str(error)})
+            errors.append(str(error))
+            continue
+        if spec is None:
+            free.append(song)
+            continue
+        name = spec["name"]
+        if name not in groups:
+            groups[name] = {"spec": spec, "songs": []}
+        elif groups[name]["spec"] != spec:
+            conflicts.add(name)
+        groups[name]["songs"].append(song)
+    purchases = []
+    for name, group in groups.items():
+        if name in conflicts:
+            error = f"购买项 {name} 在本批同时被解释为不同类别。"
+            errors.append(error)
+            invalid.extend({**song, "error": error} for song in group["songs"])
+            continue
+        spec = group["spec"]
+        purchases.append({"spec": spec, "songs": group["songs"],
+            "item": {"item_id": name, "type": spec["kind"], "is_available": True},
+            "purchase_item": {"purchase_name": name, "item_id": name, "type": spec["kind"], "amount": 1},
+            "discount_active": False, "vouchers_allowed": False})
+    return {"purchases": purchases, "free_songs": free, "invalid_songs": invalid,
+            "skipped_songs": skipped, "errors": errors}
+
+
+def purchase_skips(analysis):
+    return [*analysis["skipped_songs"], *({**song, "reason": song["error"]} for song in analysis["invalid_songs"])]
+
+
+def purchase_skip_signature(task):
+    return fingerprint({"songs": task["songs"], "source": task.get("source"),
+                        "overrides": task.get("purchase_overrides", {}),
+                        "skips": purchase_skips(analyze_purchases(task))})
+
+
+def confirm_purchase_skips(task):
+    _editable(task)
+    task["purchase_skip_confirmation"] = purchase_skip_signature(task)
+
+
+def purchase_specs(task):
+    analysis = analyze_purchases(task)
+    if analysis["errors"]:
+        raise PlanError("\n".join(analysis["errors"]))
+    return [entry["spec"] for entry in analysis["purchases"]]
 
 
 def update_purchase_candidates(task):
-    try:
-        task["purchase_candidates"] = purchase_specs(task)
-        task["purchase_errors"] = []
-    except PlanError as error:
-        task["purchase_candidates"], task["purchase_errors"] = [], [str(error)]
+    analysis = analyze_purchases(task)
+    task["purchase_candidates"] = [entry["spec"] for entry in analysis["purchases"]]
+    task["purchase_errors"] = analysis["errors"]
+    task["purchase_preview"] = analysis
+    task["purchase_warnings"] = [song["reason"] for song in purchase_skips(analysis)]
 
 
 def _chart_map(data):
     values = {i: -1 for i in range(5)}
-    for chart in (data or {}).get("charts", []):
+    if data is not None and not isinstance(data, dict):
+        raise PlanError("远端歌曲定数结构无效。")
+    charts = (data or {}).get("charts", [])
+    if not isinstance(charts, list) or not all(isinstance(chart, dict) for chart in charts):
+        raise PlanError("远端歌曲定数结构无效。")
+    seen = set()
+    for chart in charts:
         difficulty, value = chart.get("difficulty"), chart.get("chart_const")
         if (type(difficulty) is not int or difficulty not in values or type(value) not in {int, float}
-                or not math.isfinite(value)):
+                or not math.isfinite(value) or difficulty in seen):
             raise PlanError("远端歌曲定数结构无效。")
+        seen.add(difficulty)
         values[difficulty] = value
     return values
+
+
+def _song_matches(data, desired, *, complete=False):
+    if (not isinstance(data, dict) or data.get("name") != desired["name"]
+            or data.get("song_id", desired["song_id"]) != desired["song_id"]):
+        return False
+    if complete and (data.get("song_id") != desired["song_id"]
+                     or not isinstance(data.get("charts"), list) or len(data["charts"]) != 5):
+        return False
+    try:
+        return _chart_map(data) == _chart_map(desired)
+    except PlanError:
+        return False
 
 
 def _available(item):
@@ -299,7 +530,8 @@ def _available(item):
 
 def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, message: None,
              allow_missing=False):
-    """No automatic HTTP retries. Resume reconciles resource state before writes."""
+    """Never automatically replay writes; resume reconciles current remote data."""
+    _editable(task)
     if task.get("input_errors"):
         raise PlanError("原批次仍有 ERROR，不能只执行成功部分的 03 操作。")
     publication = task.get("publication") or {}
@@ -307,7 +539,7 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
             or publication.get("kind") not in {"verified", "manual_confirmed"}):
         raise PlanError("尚未确认本批最终 songlist 与已上传资源一致。")
     source = Path(task["source"]["path"])
-    if source.exists() and digest(source) != task["source"]["sha256"]:
+    if not task.get("followup") and source.exists() and digest(source) != task["source"]["sha256"]:
         raise PlanError("确认后审核 songlist 已改变，请重新载入并确认上传状态。")
     if task.get("endpoint") and task["endpoint"] != api.base_url:
         raise PlanError("该 03 任务属于另一 API 地址，请为新服务器建立任务。")
@@ -318,7 +550,11 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
     missing = missing_constants(task)
     if missing and not allow_missing:
         raise PlanError("真实谱面仍有未填定数，须先在界面确认后继续。")
-    specs = purchase_specs(task) if task["options"]["purchases"] else []
+    analysis = analyze_purchases(task) if task["options"]["purchases"] else None
+    skipped = purchase_skips(analysis) if analysis else []
+    if skipped and task.get("purchase_skip_confirmation") != purchase_skip_signature(task):
+        raise PlanError("本批有待跳过的购买项，请先在执行 03 前的弹窗中确认，或编辑购买项安排。")
+    specs = [entry["spec"] for entry in analysis["purchases"]] if analysis else []
     if task["options"]["constants"]:
         for row in task["songs"]:
             if not isinstance(english_name(row), str) or not english_name(row).strip():
@@ -342,10 +578,17 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
             existing = api.get_optional("/purchases/" + spec["name"])
             if existing is None:
                 raise PlanError(f"{spec['name']}: 已有物品不可用，需人工确认。")
+    constant_inputs = {row["id"]: [row, task["actual"][row["id"]], task["constants"].get(row["id"], {})]
+                       for row in task["songs"]}
+    song_records = {}
     if task["options"]["constants"]:
         for row in task["songs"]:
+            old = task["progress"].get("constants:" + row["id"], {})
+            if old.get("state") == "done" and old.get("sha256") == fingerprint(constant_inputs[row["id"]]):
+                continue
             on_log("info", f"正在核验歌曲定数 {row['id']}。")
-            _chart_map(api.get_optional("/songs/" + row["id"]))
+            song_records[row["id"]] = api.get_optional("/songs/" + row["id"])
+            _chart_map(song_records[row["id"]])
     task["endpoint"], task["state"] = api.base_url, "running"
     persist(task)
 
@@ -355,6 +598,10 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
         if old.get("state") == "done" and old.get("sha256") == signature:
             on_log("info", f"{key} 已完成，跳过重复执行。")
             return
+        if key.startswith("refresh:"):
+            if old.get("state") in {"running", "uncertain"}:
+                on_log("warning", f"{key} 上次结果未确认；本次将重新执行此刷新，不会直接标记成功。")
+            on_log("info", f"正在执行 {key}；大型资源刷新可能需要数分钟，等待服务器返回。")
         task["progress"][key] = {"state": "running", "sha256": signature}
         persist(task)
         try:
@@ -364,7 +611,8 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
             task["progress"][key]["state"] = state
             task["state"] = state
             persist(task)
-            on_log("error", f"{key} 未完成，已保存进度：{error}")
+            result = "结果未确认" if state == "uncertain" else "未完成"
+            on_log("error", f"{key} {result}，已保存进度：{error}")
             raise
         task["progress"][key]["state"] = "done"
         persist(task)
@@ -372,6 +620,8 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
 
     if missing:
         on_log("warning", "未填定数：" + ", ".join(missing) + "；保留已有值，新增记录暂用 -1。")
+    for song in skipped:
+        on_log("warning", f"已确认跳过 {song['id']} 的购买项：{song['reason']}；继续本批其他操作。")
     if task["options"]["refresh_resources"]:
         for operation in RESOURCE_OPERATIONS:
             step("refresh:" + operation, [task["source"]["sha256"], publication.get("confirmation_id")],
@@ -423,7 +673,7 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
 
     def constants(row):
         sid = row["id"]
-        existing = api.get_optional("/songs/" + sid)
+        existing = song_records[sid]
         values = _chart_map(existing)
         for difficulty in range(5):
             entered = parse_constant(task["constants"].get(sid, {}).get(str(difficulty)))
@@ -434,7 +684,7 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
         desired = {"song_id": sid, "name": english_name(row),
                    "charts": [{"difficulty": i, "chart_const": values[i]} for i in range(5)]}
         if existing is None:
-            api.request("POST", "/songs", desired)
+            verified = api.request("POST", "/songs", desired)
         else:
             patch = {}
             if existing.get("name") != desired["name"]:
@@ -444,16 +694,27 @@ def run_task(task, api, *, persist=lambda task: None, on_log=lambda level, messa
             if charts:
                 patch["charts"] = charts
             if patch:
-                api.request("PUT", "/songs/" + sid, patch)
-        verified = api.get_optional("/songs/" + sid)
-        if not verified or verified.get("name") != desired["name"] or _chart_map(verified) != values:
+                verified = api.request("PUT", "/songs/" + sid, patch)
+            else:
+                if not _song_matches(existing, desired):
+                    raise PlanError(f"{sid}: 远端曲目记录与请求 ID 不一致。")
+                return  # The preflight read already matches; no write to verify.
+        if not _song_matches(verified, desired, complete=True):
+            verified = api.get_optional("/songs/" + sid)
+        if not _song_matches(verified, desired):
+            if any(c["chart_const"] == 0 for c in desired["charts"]):
+                legacy_zero_view = {**desired, "charts": [
+                    {**c, "chart_const": -1 if c["chart_const"] == 0 else c["chart_const"]}
+                    for c in desired["charts"]]}
+                if _song_matches(verified, legacy_zero_view):
+                    raise PlanError(f"{sid}: API 将请求的 0.0 回显为 -1，无法精确核验；"
+                                    "请修复服务端 core/song.py 的零值序列化后重试，或明确改填 -1。")
             raise PlanError(f"{sid}: 曲目定数写入后核验不一致。")
 
     if task["options"]["constants"]:
         for row in task["songs"]:
             sid = row["id"]
-            inputs = [row, task["actual"][sid], task["constants"].get(sid, {})]
-            step("constants:" + sid, inputs, lambda row=row: constants(row))
+            step("constants:" + sid, constant_inputs[sid], lambda row=row: constants(row))
     if task["options"]["refresh_rating"]:
         step("refresh:" + RATING_OPERATION, [task["songs"], task["actual"], task["constants"]],
              lambda: api.request("POST", "/system/operations/" + RATING_OPERATION, {}))

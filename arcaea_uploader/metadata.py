@@ -7,6 +7,24 @@ import re
 from .import_rules import validate_rating_values
 
 
+def order_song_fields(row):
+    """Arrange generated metadata without adding fields or changing values."""
+    anchors = {"bg": ("bg_inverse",), "date": ("version", "remote_dl")}
+    adjacent = {field for anchor, fields in anchors.items() if anchor in row for field in fields}
+    ordered = {"idx": row["idx"]} if "idx" in row else {}
+    for key, value in row.items():
+        if key == "idx" or key in adjacent:
+            continue
+        ordered[key] = value
+        for field in anchors.get(key, ()):
+            if field in row:
+                ordered[field] = row[field]
+    row.clear()
+    row.update(ordered)
+    for difficulty in row.get("difficulties", []):
+        order_song_fields(difficulty)
+
+
 def strip_trailing_commas(text):
     result = []
     quoted = escaped = False

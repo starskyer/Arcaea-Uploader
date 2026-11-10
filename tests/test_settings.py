@@ -100,6 +100,19 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaises(PlanError):
                     load_settings(path)
 
+    def test_api_proxy_setting_defaults_for_old_profiles_and_requires_a_boolean(self):
+        path = self.root / "config.json"
+        path.write_text('{"api":{"base_url":"https://example.test/api/v1"}}', encoding="utf-8")
+        settings = load_settings(path)
+        self.assertTrue(settings["api"]["use_system_proxy"])
+        settings["api"]["use_system_proxy"] = False
+        save_settings(path, settings)
+        self.assertFalse(load_settings(path)["api"]["use_system_proxy"])
+        for invalid in ("false", 0, None):
+            path.write_text(json.dumps({"api": {"use_system_proxy": invalid}}), encoding="utf-8")
+            with self.assertRaises(PlanError):
+                load_settings(path)
+
 
 if __name__ == "__main__":
     unittest.main()

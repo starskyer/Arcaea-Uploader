@@ -36,7 +36,7 @@ Windows 构建须使用 64 位 Windows Python。脚本在独立临时工作区�
 
 1. 更新 `pyproject.toml` 与 `arcaea_uploader/__init__.py` 的版本及 CHANGELOG。
 2. 在 main 上确认 CI 通过，检查分发内容与当前功能说明。
-3. 创建并推送对应标签，例如 `git tag v0.1.0`、`git push origin v0.1.0`。
+3. 创建并推送对应标签，例如 `git tag -a v0.2.0 -m "Arcaea-Uploader v0.2.0 preview"`、`git push origin v0.2.0`。
 4. 检查 Preview release 工作流及 Releases 附件，在干净环境解压运行验证。
 
 当前流程始终标为预发布。完整三阶段已经接入，稳定版策略仍需在后续实机验收后单独决定；GitHub 自动生成的 Source code ZIP 不包含可运行的 EXE。

@@ -90,6 +90,24 @@ class AccumulationTests(unittest.TestCase):
         self.assertEqual(len({r["idx"] for r in rows}), 2)
         self.assertEqual(read_json(self.batch / "report.json")["counts"]["normalized"], 2)
 
+    def test_repeated_append_keeps_arbitrary_active_edits_and_manual_preview(self):
+        stage = self.batch / "prepared/active"
+        custom = stage / "char/custom.bin"
+        custom.parent.mkdir(parents=True)
+        custom.write_bytes(b"hand edited resource")
+        image = stage / "songs/dl_validid/1080_base.jpg"
+        Image.new("RGB", (512, 512), "yellow").save(image)
+        image_hash = digest(image)
+        preview = stage / "songs/dl_validid/preview.ogg"
+        preview.write_bytes(b"manual preview")
+        for _ in range(3):
+            self.append(self.root / "incoming")
+            self.assertEqual(custom.read_bytes(), b"hand edited resource")
+            self.assertEqual(digest(image), image_hash)
+            self.assertEqual(preview.read_bytes(), b"manual preview")
+        self.fixture.publish(self.batch)
+        self.assertEqual((self.fixture.assets / "char/custom.bin").read_bytes(), b"hand edited resource")
+
     def test_repeated_import_keeps_reviewed_fields_and_deletions_across_rounds(self):
         review = Path(self.plan["review_songlist"])
         document = read_json(review)
@@ -104,6 +122,10 @@ class AccumulationTests(unittest.TestCase):
         for _ in range(3):
             self.append(self.root / "incoming")
             self.assertEqual(read_json(review)["songs"][0], expected)
+            keys = list(read_json(review)["songs"][0])
+            self.assertEqual(keys[0], "idx")
+            self.assertEqual(keys[keys.index("date"):keys.index("date") + 3], ["date", "version", "remote_dl"])
+            self.assertEqual(keys[keys.index("bg") + 1], "bg_inverse")
         self.assertTrue(read_json(self.batch / "publish.json")["review_protected_paths"]["validid"])
         # A genuinely new difficulty must still be imported beside reviewed ones.
         second = self.root / "patch"
@@ -142,6 +164,30 @@ class AccumulationTests(unittest.TestCase):
         self.assertTrue((self.batch / "songs/validid/3.aff").is_file())
         result = self.fixture.publish(self.batch)
         self.assertEqual(load_task(result["server_task_file"])["actual"]["validid"], [2, 3])
+
+    def test_append_learns_and_snapshots_png_background_pair_without_binding_drift(self):
+        from arcaea_uploader.workspaces import workspace_settings
+        second = self.root / "new-backgrounds"
+        folder = self.package(second)
+        row = read_json(folder / "songlist")
+        row.update(bg="custom_day", bg_inverse="custom_night")
+        (folder / "songlist").write_text(json.dumps(row), encoding="utf-8")
+        for name in ("custom_day", "custom_night"):
+            Image.new("RGBA", (650, 450), (30, 40, 50, 128)).save(folder / (name + ".png"))
+        original = tree_hashes(second)
+        plan = self.append(second)
+        self.assertEqual(plan["learned_background_pairs"], {"custom_day": "custom_night"})
+        restored = workspace_settings(self.root / "releases", self.batch, self.settings, self.root)
+        self.assertEqual(restored["import"]["background_pairs"]["custom_day"], "custom_night")
+        # Same raw UI settings can repeat 01, then restored settings can run 02.
+        self.append(second)
+        self.settings.update(restored)
+        result = self.fixture.publish(self.batch)
+        self.assertEqual(result["version"], "7.0.256.5")
+        self.assertEqual(tree_hashes(second), original)
+        for name in ("custom_day", "custom_night"):
+            with Image.open(self.fixture.assets / f"img/bg/1080/{name}.jpg") as image:
+                self.assertEqual((image.size, image.format), ((1920, 1440), "JPEG"))
 
     def test_failed_addition_keeps_previous_files_but_blocks_subset_publication(self):
         second = self.root / "bad-import"
@@ -193,10 +239,24 @@ class AccumulationTests(unittest.TestCase):
         self.assertEqual(plan["actual"]["validid"], [2, 3])
         self.assertEqual(tree_hashes(self.fixture.assets), original)
 
-    def test_version_change_requires_separate_batch(self):
+    def test_changed_import_version_allows_append_and_preserves_reviewed_versions(self):
+        review = Path(self.plan["review_songlist"])
+        document = read_json(review)
+        document["songs"][0]["version"] = "7.1.1"
+        review.write_text(json.dumps(document), encoding="utf-8")
         self.settings["import"]["version"] = "7.2"
-        with self.assertRaisesRegex(PlanError, "version 必须一致"):
-            self.append(self.root / "incoming")
+        second = self.root / "two"
+        self.package(second)
+        self.assertEqual(len(self.append(second)["songs"]), 2)
+        self.assertEqual({r["id"]: r["version"] for r in read_json(review)["songs"]},
+                         {"validid": "7.1.1", "second": "7.2"})
+        self.settings["import"]["version"] = "7.3"
+        self.append(second)
+        self.assertEqual({r["id"]: r["version"] for r in read_json(review)["songs"]},
+                         {"validid": "7.1.1", "second": "7.3"})
+        self.assertEqual(read_json(self.batch / "publish.json")["binding"]["import"]["version"], "7.3")
+        self.assertEqual(self.fixture.publish(self.batch)["version"], "7.0.256.5")
+
 
     def test_locked_build_cannot_accept_more_imports(self):
         from test_publishing import MemoryUpload
@@ -206,13 +266,32 @@ class AccumulationTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanError, "已开始打包"):
             self.append(self.root / "incoming")
 
-    def test_prior_source_drift_is_checked_after_multiple_additions(self):
+    def test_other_source_edits_do_not_block_append_or_change_its_snapshot(self):
         second = self.root / "two"
         self.package(second)
         self.append(second)
+        old_chart = (self.batch / "prepared/database/songs/validid/2.aff").read_bytes()
         (self.fixture.package / "2.aff").write_bytes(b"modified original")
-        with self.assertRaisesRegex(PlanError, "资源发生变化"):
-            self.fixture.publish(self.batch)
+        (self.fixture.package / "slst.txt").write_text('{"invalid":"author edit"}', encoding="utf-8")
+        third = self.root / "three"
+        self.package(third, "third")
+        self.assertEqual(len(self.append(third)["songs"]), 3)
+        self.assertEqual((self.batch / "prepared/database/songs/validid/2.aff").read_bytes(), old_chart)
+        self.assertEqual(self.fixture.publish(self.batch)["version"], "7.0.256.5")
+        self.assertEqual((self.fixture.database / "songs/validid/2.aff").read_bytes(), old_chart)
+
+    def test_source_saved_during_explicit_import_still_aborts_without_changing_review(self):
+        from test_publishing import preview
+        second = self.root / "two"
+        folder = self.package(second)
+        before = tree_hashes(self.batch / "prepared")
+        def save_source_during_render(*args, **kwargs):
+            preview(*args, **kwargs)
+            (folder / "songlist").write_bytes(b"changed during import")
+        with patch("arcaea_uploader.publishing.create_preview", side_effect=save_source_during_render):
+            with self.assertRaisesRegex(PlanError, "资源发生变化"):
+                self.append(second)
+        self.assertEqual(tree_hashes(self.batch / "prepared"), before)
 
     def test_unsaved_external_race_preserves_newer_saved_songlist(self):
         from test_publishing import preview
@@ -253,6 +332,65 @@ class AccumulationTests(unittest.TestCase):
         self.assertFalse((self.batch / "append-transaction.json").exists())
         self.assertTrue((self.batch / "prepared/database/songs/validid/2.aff").is_file())
         self.assertEqual(self.fixture.publish(self.batch)["version"], "7.0.256.5")
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory sharing")
+    def test_locked_file_under_prepared_retains_review_and_retries_after_handle_closes(self):
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel.CreateFileW
+        create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                           wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        create.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        second = self.root / "two"
+        self.package(second)
+        before = tree_hashes(self.batch / "prepared")
+        preview_path = self.batch / "prepared/active/songs/dl_validid/preview.ogg"
+        handle = create(str(preview_path), 0x80000000, 3, None, 3, 0x80, None)
+        self.assertNotEqual(handle, wintypes.HANDLE(-1).value, ctypes.get_last_error())
+        try:
+            with self.assertRaisesRegex(PlanError, "Windows 拒绝重命名"):
+                self.append(second)
+            self.assertEqual(tree_hashes(self.batch / "prepared"), before)
+            self.assertFalse((self.batch / "append-transaction.json").exists())
+            self.assertTrue(read_json(self.batch / "publish.json")["pending_append"])
+        finally:
+            kernel.CloseHandle(handle)
+        self.assertEqual(len(self.append(second)["songs"]), 2)
+        self.assertNotIn("pending_append", read_json(self.batch / "publish.json"))
+
+    def test_mid_commit_rename_denial_rolls_back_both_trees_before_retry(self):
+        second = self.root / "two"
+        self.package(second)
+        before = tree_hashes(self.batch / "prepared"), tree_hashes(self.batch / "songs")
+        rename = Path.rename
+        def deny_old_songs(path, target):
+            if path == self.batch / "songs":
+                raise PermissionError("synthetic locked directory")
+            return rename(path, target)
+        with patch.object(Path, "rename", autospec=True, side_effect=deny_old_songs), patch(
+                "arcaea_uploader.accumulation.sleep"):
+            with self.assertRaisesRegex(PlanError, "Windows 拒绝重命名"):
+                self.append(second)
+        self.assertEqual((tree_hashes(self.batch / "prepared"), tree_hashes(self.batch / "songs")), before)
+        self.assertFalse((self.batch / "append-transaction.json").exists())
+        self.assertEqual(len(self.append(second)["songs"]), 2)
+
+    def test_transient_rename_denial_is_retried_without_losing_the_candidate(self):
+        second = self.root / "two"
+        self.package(second)
+        rename, denials = Path.rename, []
+        def deny_once(path, target):
+            if path == self.batch / "prepared" and not denials:
+                denials.append(path)
+                raise PermissionError("synthetic transient lock")
+            return rename(path, target)
+        with patch.object(Path, "rename", autospec=True, side_effect=deny_once), patch(
+                "arcaea_uploader.accumulation.sleep") as pause:
+            self.assertEqual(len(self.append(second)["songs"]), 2)
+        self.assertEqual(len(denials), 1)
+        pause.assert_called_once_with(0.2)
 
     def test_unchanged_wav_is_not_retranscoded_when_rescanning(self):
         ffmpeg = os.environ.get("ARCAEA_UPLOADER_TEST_FFMPEG") or shutil.which("ffmpeg")

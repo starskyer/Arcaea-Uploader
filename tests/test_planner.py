@@ -16,6 +16,7 @@ from arcaea_uploader.planner import (
 class MergeTests(unittest.TestCase):
     def test_add_difficulty_preserves_index_metadata_and_original(self):
         master = {"format": "custom", "songs": [{"id": "song", "idx": 18,
+                  "remote_dl": False, "version": "old", "date": 1, "bg_inverse": "night", "bg": "day",
                   "title_localized": {"en": "Title"}, "difficulties": [
                       {"ratingClass": 2, "rating": 9}]}]}
         before = deepcopy(master)
@@ -27,6 +28,10 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(merged["songs"][0]["title_localized"], {"en": "Title"})
         self.assertEqual([d["ratingClass"] for d in merged["songs"][0]["difficulties"]], [2, 3])
         self.assertTrue(merged["songs"][0]["remote_dl"])
+        keys = list(merged["songs"][0])
+        self.assertEqual(keys[0], "idx")
+        self.assertEqual(keys[keys.index("date"):keys.index("date") + 3], ["date", "version", "remote_dl"])
+        self.assertEqual(keys[keys.index("bg") + 1], "bg_inverse")
         self.assertEqual(conflicts, [])
 
     def test_conflict_retains_existing_value_and_merges_new_fields(self):
@@ -143,8 +148,8 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn("img/bg/unknown.jpg", paths)
         Image.new("RGB", (100, 100)).save(folder / "unknown.jpg")
         plan = self.plan()
-        self.assertFalse(plan["valid"])
-        self.assertTrue(any("新尺寸" in e for e in plan["errors"]))
+        self.assertTrue(plan["valid"], plan["errors"])
+        self.assertTrue(any(f["path"] == "img/bg/1080/unknown.jpg" and f["action"] == "prepare_media" for f in plan["files"]))
 
     def test_identical_download_file_is_unchanged(self):
         folder = self.package()
@@ -226,7 +231,7 @@ class PlanTests(unittest.TestCase):
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["valid"])
-        Image.new("RGB", (1, 1)).save(self.incoming / "sample" / "unknown.jpg")
+        (self.incoming / "sample" / "unknown.jpg").write_bytes(b"not a valid image")
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertFalse(json.loads(result.stdout)["valid"])

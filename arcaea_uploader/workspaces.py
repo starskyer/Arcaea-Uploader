@@ -326,12 +326,13 @@ def bind_workspace_api(root, batch, settings):
             snapshot_workspace_settings(batch, settings)
             marker = _read(path)
         marker["settings"]["api"] = {key: settings["api"][key] for key in ("base_url", "token_env")}
+        marker["settings"]["api"]["use_system_proxy"] = settings["api"].get("use_system_proxy", True)
         write_json(path, marker)
 
 
 def commit_workspace(root, batch, *, expected_revision=None):
     """Explicit final commit: verified 02 + current successful/skipped 03."""
-    from .server_tasks import (load_task, task_complete, task_lock)
+    from .server_tasks import (archive_info, load_task, task_complete, task_lock)
     from .publishing import _check_hashes
     root, batch = _locations(root, batch)
     with workspace_lock(root, batch):
@@ -363,9 +364,21 @@ def commit_workspace(root, batch, *, expected_revision=None):
                 directory.mkdir(exist_ok=True)
             archive_task = archived / (batch.name + ".json")
             with task_lock(archive_task):
-                write_json(archive_task, task)
+                prior = _read(archive_task) if archive_task.is_file() else None
+                prior_archive = archive_info(prior, archive_task) if prior else None
+                if prior_archive:
+                    if prior.get("completion_signature") != task["completion_signature"]:
+                        raise PlanError("已有提交归档与当前任务不一致，拒绝覆盖原记录。")
+                    completed_at = prior_archive.get("completed_at") or timestamp()
+                else:
+                    completed_at = timestamp()
+                    snapshot_task = deepcopy(task)
+                    snapshot_task["archive"] = {"kind": "workspace_commit", "completed_at": completed_at,
+                        "history_file": str(history / (batch.name + ".json")),
+                        "api_base_url": task.get("endpoint") or (snapshot or {}).get("api", {}).get("base_url", "")}
+                    write_json(archive_task, snapshot_task)
             path = history / (batch.name + ".json")
-            record = {"batch_id": batch.name, "completed_at": timestamp(), "committed": True,
+            record = {"batch_id": batch.name, "completed_at": completed_at, "committed": True,
                       "local_verified": True, "remote_verified": True, "bundle_version": publication["build"]["version"],
                       "songlist_sha256": receipt["songlist_sha256"], "server_operations": task["state"],
                       "completion_signature": task["completion_signature"], "options": task["options"],

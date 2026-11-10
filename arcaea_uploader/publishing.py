@@ -7,26 +7,26 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 from time import perf_counter
 from tempfile import mkdtemp, TemporaryDirectory
 
-from .backgrounds import BackgroundIndex, check_references
+from .backgrounds import BackgroundIndex, check_references, normalize_background
 from .bundler import build_configured_bundle, validate_bundle
 from .bundle_versions import read_history, resolve_bundle_versions
-from .import_rules import actual_chart_classes, portable_id
+from .import_rules import actual_chart_classes, portable_id, require_version
 from .media import create_preview, normalize_jacket, preview_interval
 from .planner import PlanError, build_plan, check_difficulties, digest, read_json, resolve_config
 from .preprocess import preprocess_settings
 from .private_files import copy_writable, replace_copy
 from .server_tasks import (confirm_uploaded, load_task, make_task, read_reviewed, save_task,
                            task_lock, task_path)
-from .settings import effective_settings, normalize_settings, user_data_dir
+from .settings import effective_settings, normalize_settings, user_data_dir, remember_background_pairs
 from .ssh_upload import SSHUpload, remote_database
 from .workspaces import (ensure_plain_tree, linked, load_workspace, snapshot_workspace_settings,
                          sync_workspace_task, timestamp, workspace_lock, write_json)
 
 
-EDITABLE = {"songs/songlist", "songs/packlist", "songs/unlocks"}
 DOWNLOAD = re.compile(r"(?:[0-4]\.aff|(?:base|[0-4])\.ogg|video_1080\.mp4)")
 
 
@@ -50,6 +50,48 @@ def _binding(settings):
     return {"import": settings["import"], "bundle": settings["bundle"],
             "local": {key: settings["local"][key] for key in (
                 "input_root", "assets_root", "server_project_root", "database_relative_path", "placeholder_aff")}}
+
+
+def _restore_inferred_policy(settings, requested, record):
+    """Recover learned pairs while retaining the current import version default."""
+    previous = record.get("requested_import")
+    if previous is not None and ({k: v for k, v in requested.items() if k != "version"}
+                                == {k: v for k, v in previous.items() if k != "version"}):
+        version = settings["import"]["version"]
+        settings["import"] = deepcopy(record["binding"]["import"])
+        settings["import"]["version"] = version
+
+
+def _binding_differences(before, after, *, editable_version=False):
+    labels = {
+        "import.version": "本次导入 version", "import.background_pairs": "背景对应表",
+        "import.background_pairs_initialized": "背景对应表初始化状态",
+        "import.background_pair_conflicts": "背景冲突记录",
+        "bundle.follow_app_version": "沿用当前应用版本", "bundle.app_version": "应用版本",
+        "local.input_root": "待更新曲目目录", "local.assets_root": "待打包资源（active）",
+        "local.server_project_root": "本地 Arcaea-server 项目",
+        "local.database_relative_path": "本地 database 相对路径",
+        "local.placeholder_aff": "占位谱面",
+    }
+    differences = []
+    for section in sorted(before.keys() | after.keys()):
+        old, new = before.get(section, {}), after.get(section, {})
+        for key in sorted(old.keys() | new.keys()):
+            if editable_version and (section, key) == ("import", "version"):
+                continue
+            expected, current = old.get(key), new.get(key)
+            if expected == current:
+                continue
+            field = section + "." + key
+            if isinstance(expected, dict) and isinstance(current, dict):
+                changed = sorted(k for k in expected.keys() | current.keys() if expected.get(k) != current.get(k))
+                detail = "变动条目：" + "、".join(changed[:8])
+                if len(changed) > 8:
+                    detail += f" 等 {len(changed)} 项"
+            else:
+                detail = f"01：{expected if expected != '' else '（空）'}；当前：{current if current != '' else '（空）'}"
+            differences.append(f"- {labels.get(field, field)}（{field}）：{detail}")
+    return differences
 
 
 def _database(settings):
@@ -105,6 +147,12 @@ def _check_hashes(root, expected, *, except_paths=()):
         raise PlanError(f"资源发生变化，请重新执行 01（保留审核内容供参照）：{root}")
 
 
+def asset_changes(before, after):
+    return [{"path": path, "action": "add" if path not in before else "remove" if path not in after else "modify",
+             "before_sha256": before.get(path), "sha256": after.get(path)}
+            for path in sorted(before.keys() | after.keys()) if before.get(path) != after.get(path)]
+
+
 def _config_for_plan(settings, normalized, path):
     config = deepcopy(settings)
     config["local"]["input_root"] = str(normalized)
@@ -117,7 +165,7 @@ def _log(callback, level, message):
         callback({"level": level, "code": "publication." + level, "message": message, "song_id": None})
 
 
-def apply_prepared_files(plan, staged_assets, staged_database, temporary_root):
+def apply_prepared_files(plan, staged_assets, staged_database, temporary_root, *, preserve_assets=(), callback=None):
     """Apply a validated plan to a private preparation candidate."""
     for entry in plan["files"]:
         source = Path(entry["source"])
@@ -127,10 +175,15 @@ def apply_prepared_files(plan, staged_assets, staged_database, temporary_root):
         target.parent.mkdir(parents=True, exist_ok=True)
         if entry["area"] == "assets" and source.suffix == ".jpg" and entry["action"] == "prepare_media":
             with TemporaryDirectory(prefix=".jacket-check-", dir=temporary_root) as temporary:
-                normalized = normalize_jacket(source, Path(temporary))
+                background = entry["path"].startswith("img/bg/")
+                normalized = (normalize_background(source, Path(temporary) / target.name) if background
+                              else normalize_jacket(source, Path(temporary)))
                 destination = target.parent / normalized.name
+                if destination.relative_to(staged_assets).as_posix() in preserve_assets:
+                    _log(callback, "info", "保留工作区人工修改的资源：" + destination.relative_to(staged_assets).as_posix())
+                    continue
                 if destination.exists() and digest(destination) != digest(normalized):
-                    raise PlanError(f"已存在不同曲绘，请人工处理后重新准备：{entry['path']}")
+                    raise PlanError(f"已存在不同图片，请人工处理后重新准备：{entry['path']}")
                 replace_copy(normalized, destination)
         elif entry["area"] == "assets" and source.suffix == ".ogg":
             continue
@@ -160,6 +213,8 @@ def prepare_update(data, origin, *, resume_from=None, on_diagnostic=None, _rebui
     baseline = tree_hashes(assets)
     input_hashes = tree_hashes(Path(local["input_root"]))
     report = preprocess_settings(settings, origin, resume_from=resume_from, on_diagnostic=on_diagnostic)
+    if report["valid"]:
+        remember_background_pairs(settings["import"], report.get("learned_background_pairs", {}))
     batch = Path(report["batch_root"])
     with workspace_lock(local["release_root"], batch):
         ensure_plain_tree(batch)
@@ -169,7 +224,8 @@ def prepare_update(data, origin, *, resume_from=None, on_diagnostic=None, _rebui
         from .diagnostics import summarize
         summarize(plan)
         plan.update(mode="prepare", batch_root=str(batch), preprocessing_report=report["report_file"],
-                    valid=not plan["errors"], publishable=False)
+                    valid=not plan["errors"], publishable=False,
+                    learned_background_pairs=report.get("learned_background_pairs", {}))
         if not plan["valid"]:
             write_json(batch / "plan.json", plan)
             if (batch / "publish.json").is_file():
@@ -249,7 +305,7 @@ def prepare_update(data, origin, *, resume_from=None, on_diagnostic=None, _rebui
         return plan
 
 
-def _render_previews(batch, record, document, ffmpeg, callback):
+def _render_previews(batch, record, document, ffmpeg, callback, *, preserve_manual=False):
     assets = batch / "prepared/active"
     database = batch / "prepared/database"
     rows = {row["id"]: row for row in document["songs"]}
@@ -267,6 +323,11 @@ def _render_previews(batch, record, document, ffmpeg, callback):
             key = f"{sid}/{name}"
             target = folder / name
             previous = record["preview_signatures"].get(key)
+            if (preserve_manual and previous and target.is_file()
+                    and (previous.get("manual") or digest(target) != previous["sha256"])):
+                record["preview_signatures"][key] = {"input": signature, "sha256": digest(target), "manual": True}
+                _log(callback, "info", f"保留人工替换的预览 {key}。")
+                continue
             if previous and previous["input"] == signature and target.is_file() and digest(target) == previous["sha256"]:
                 continue
             if target.exists() and target.stat().st_nlink > 1:
@@ -281,7 +342,7 @@ def _render_previews(batch, record, document, ffmpeg, callback):
             _log(callback, "info", f"生成预览 {sid}/{name}：{start}–{end} ms。")
 
 
-def _validate_review(batch, record, document, version, callback):
+def _validate_review(batch, record, document, callback):
     if not isinstance(document, dict) or not isinstance(document.get("songs"), list):
         raise PlanError("审核总表必须包含 songs 数组。")
     ids, indices, rows = set(), set(), {}
@@ -304,8 +365,16 @@ def _validate_review(batch, record, document, version, callback):
             if row != original[sid]:
                 raise PlanError(f"审核修改了本批范围外的曲目 {sid}，请恢复或另建批次。")
             continue
-        if not portable_id(sid) or row.get("remote_dl") is not True or row.get("version") != version:
-            raise PlanError(f"{sid}: ID、remote_dl 或本次 version 无效。")
+        if not portable_id(sid):
+            raise PlanError(f"{sid}: ID 不符合曲目目录命名规则。")
+        if row.get("remote_dl") is not True:
+            raise PlanError(f"{sid}: remote_dl 必须为 true，当前为 {row.get('remote_dl')!r}。")
+        try:
+            require_version(row.get("version"))
+        except ValueError as error:
+            raise PlanError(f"{sid}: version 必须是非空文本且不能含控制字符，当前为 {row.get('version')!r}。") from error
+        if row["version"] != original[sid].get("version"):
+            _log(callback, "info", f"{sid}: 保留人工审核 version：{original[sid].get('version')!r} → {row['version']!r}。")
         if row["idx"] != original[sid]["idx"]:
             raise PlanError(f"{sid}: 审核阶段不能修改自动分配的 idx。")
         difficulties = {d["ratingClass"]: d for d in row.get("difficulties", [])}
@@ -361,7 +430,7 @@ def _resource_lock(settings):
 
 def _target(root, relative):
     path = PurePosixPath(relative)
-    if path.is_absolute() or ".." in path.parts:
+    if path.is_absolute() or ".." in path.parts or not path.parts or "\\" in relative or ":" in relative:
         raise PlanError("发布清单路径越界。")
     result = root.joinpath(*path.parts)
     cursor = result
@@ -376,17 +445,44 @@ def _target(root, relative):
 
 def _install(entries, roots, batch, callback):
     # Preflight every file before exposing any part of this publication.
+    removed = {(entry["area"], entry["path"]) for entry in entries if entry["sha256"] is None}
     for entry in entries:
         target = _target(roots[entry["area"]], entry["path"])
         current = digest(target) if target.is_file() else None
-        if target.exists() and not target.is_file() or current not in {entry.get("existing_sha256"), entry["sha256"]}:
+        if target.is_dir() and entry["sha256"] is not None:
+            # A directory may become a file when all its old files are removed.
+            if any((entry["area"], entry["path"] + "/" + name) not in removed for name in tree_hashes(target)):
+                raise PlanError(f"本地目录仍包含本批未删除的资源：{entry['path']}")
+        if current not in {entry.get("existing_sha256"), entry["sha256"]}:
             raise PlanError(f"本地资源与审核基线不一致：{entry['area']}/{entry['path']}")
-        if digest(Path(entry["source"])) != entry["sha256"]:
+        if entry["sha256"] is not None and digest(Path(entry["source"])) != entry["sha256"]:
             raise PlanError("待发布文件被改动。")
-    for entry in entries:
+    ordered = sorted(entries, key=lambda entry: entry["sha256"] is not None)
+    for entry in ordered:
         target = _target(roots[entry["area"]], entry["path"])
+        if entry["sha256"] is None:
+            if target.is_file():
+                if digest(target) != entry["existing_sha256"]:
+                    raise PlanError("本地删除期间目标发生变化。")
+                backup = batch / "backups" / entry["area"] / entry["path"]
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                if not backup.exists():
+                    shutil.copy2(target, backup)
+                os.chmod(target, target.stat().st_mode | stat.S_IWUSR)
+                target.unlink()
+                parent, root = target.parent, roots[entry["area"]]
+                while parent != root and parent.is_relative_to(root):
+                    try:
+                        parent.rmdir()  # Empty directories only; never recurse.
+                    except OSError:
+                        break
+                    parent = parent.parent
+                _log(callback, "info", f"本地删除并备份 {entry['area']}/{entry['path']}")
+            continue
         if target.is_file() and digest(target) == entry["sha256"]:
             continue
+        if target.is_dir():
+            target.rmdir()
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.is_file():
             backup = batch / "backups" / entry["area"] / entry["path"]
@@ -403,12 +499,16 @@ def _install(entries, roots, batch, callback):
             current = digest(target) if target.is_file() else None
             if current not in {entry.get("existing_sha256"), entry["sha256"]}:
                 raise PlanError("本地就位期间目标发生变化。")
+            if target.is_file():
+                os.chmod(target, target.stat().st_mode | stat.S_IWUSR)
             temporary.replace(target)
         finally:
             temporary.unlink(missing_ok=True)
         _log(callback, "info", f"本地就位 {entry['area']}/{entry['path']}")
     for entry in entries:
-        if digest(_target(roots[entry["area"]], entry["path"])) != entry["sha256"]:
+        target = _target(roots[entry["area"]], entry["path"])
+        actual = digest(target) if target.is_file() else None
+        if actual != entry["sha256"]:
             raise PlanError("本地最终清单核验失败。")
 
 
@@ -418,7 +518,7 @@ def publish_update(data, origin, batch, *, on_diagnostic=None, on_host_key=None,
     remote_root = remote_database(settings)  # Blank host fails before building.
     root, batch = Path(settings["local"]["release_root"]), Path(batch).resolve()
     with _resource_lock(settings), workspace_lock(root, batch):
-        from .accumulation import recover_append, check_sources
+        from .accumulation import recover_append, report_source_changes
         recover_append(batch)
         record = load_preparation(root, batch)
         if record.get("state") in {"awaiting_stage03", "committed_cleanup_pending"}:
@@ -430,17 +530,27 @@ def publish_update(data, origin, batch, *, on_diagnostic=None, on_host_key=None,
             raise PlanError("本批仍有未完成的追加，请修复并再次执行 01，不能只发布先前成功的部分。")
         if record.get("state") in {"preparing", "blocked"}:
             raise PlanError("01 尚未完成，请先继续准备并解决 ERROR。")
-        if normalize_settings(data, origin)["import"] == record.get("requested_import"):
-            # A successful local install can teach new background pairs. Those
-            # inferred changes are not edits to the user's original settings.
-            settings["import"] = deepcopy(record["binding"]["import"])
-        if record["binding"] != _binding(settings):
-            raise PlanError("01 后导入配置或本地路径发生变化，请恢复原配置或重新准备。")
+        require_version(settings["import"]["version"])
+        requested_import = normalize_settings(data, origin)["import"]
+        _restore_inferred_policy(settings, requested_import, record)
+        differences = _binding_differences(record["binding"], _binding(settings), editable_version=not record.get("build"))
+        if differences:
+            raise PlanError("01 后导入配置或本地路径发生变化：\n" + "\n".join(differences) +
+                            "\n请在工作区管理中选择此批次并点击“继续所选批次”，恢复批次配置后重试 02。"
+                            "工作区 prepared/active 中的资源编辑无需撤销。")
+        if not record.get("build") and record["binding"]["import"]["version"] != settings["import"]["version"]:
+            old_version = record["binding"]["import"]["version"]
+            record["binding"]["import"]["version"] = settings["import"]["version"]
+            if record.get("requested_import") is not None:
+                record["requested_import"]["version"] = requested_import["version"]
+            write_json(batch / "publish.json", record)
+            _log(on_diagnostic, "info", f"导入 version 默认值已修改：{old_version!r} → {settings['import']['version']!r}；"
+                 "02 保留审核总表逐曲保存的 version，不自动覆盖。")
         snapshot_workspace_settings(batch, settings)
         local = settings["local"]
         assets, database = Path(local["assets_root"]), _database(settings)
         stage, staged_database = batch / "prepared/active", batch / "prepared/database"
-        check_sources(record)
+        record["source_changes"] = report_source_changes(record, on_diagnostic)
         _check_hashes(batch / "songs", record["normalized_sha256"])
         target_binding = {key: settings["ssh"][key] for key in ("host", "port", "username")}
         target_binding["database"] = remote_root
@@ -450,19 +560,25 @@ def publish_update(data, origin, batch, *, on_diagnostic=None, on_host_key=None,
             _check_hashes(assets, record["baseline"], except_paths={"songs/packlist", "songs/unlocks"})
             if _download_baseline(database, record["ids"]) != record["database_baseline"]:
                 raise PlanError("本地下载资源基线发生变化，请重新准备。")
-            _check_hashes(stage, record["prepared_assets"], except_paths=EDITABLE | {"metadata.oldjson"})
             _check_hashes(staged_database, record["prepared_database"])
             _sync_documents(assets, stage, record)
+            review_assets = tree_hashes(stage)
+            changes = asset_changes(record["baseline"], review_assets)
+            record["review_changes"] = changes
+            labels = {"add": "新增", "modify": "修改", "remove": "删除"}
+            _log(on_diagnostic, "info", "02 工作区 active 差异：" + "，".join(
+                f"{label} {sum(item['action'] == action for item in changes)} 项" for action, label in labels.items()))
+            for change in changes:
+                _log(on_diagnostic, "info", f"{labels[change['action']]} active/{change['path']}")
             reviewed_sha = digest(stage / "songs/songlist")
             reviewed = read_json(stage / "songs/songlist")
-            _validate_review(batch, record, reviewed, settings["import"]["version"], on_diagnostic)
-            _render_previews(batch, record, reviewed, local["ffmpeg_path"], on_diagnostic)
+            _validate_review(batch, record, reviewed, on_diagnostic)
+            _render_previews(batch, record, reviewed, local["ffmpeg_path"], on_diagnostic, preserve_manual=True)
             if digest(stage / "songs/songlist") != reviewed_sha:
                 raise PlanError("生成预览期间审核总表发生变化，请重试。")
             _check_hashes(staged_database, record["prepared_database"])
-            check_sources(record)
             preview_paths = {"songs/dl_" + key for key in record["preview_signatures"]}
-            _check_hashes(stage, record["prepared_assets"], except_paths=EDITABLE | preview_paths | {"metadata.oldjson"})
+            _check_hashes(stage, review_assets, except_paths=preview_paths)
             # Persist new previews before the build checkpoint, so a failed
             # build can be retried without misidentifying generated files as edits.
             record["prepared_assets"] = tree_hashes(stage)
@@ -494,10 +610,14 @@ def publish_update(data, origin, batch, *, on_diagnostic=None, on_host_key=None,
                 raise PlanError("Bundler 版本链或历史核验失败。")
             entries = []
             current_baseline = tree_hashes(assets)
-            for relative, value in tree_hashes(stage).items():
+            final_assets = tree_hashes(stage)
+            for relative, value in final_assets.items():
                 if value != current_baseline.get(relative):
                     entries.append({"area": "assets", "path": relative, "source": str(stage / relative),
                                     "sha256": value, "existing_sha256": current_baseline.get(relative)})
+            for relative in sorted(current_baseline.keys() - final_assets.keys()):
+                entries.append({"area": "assets", "path": relative, "sha256": None,
+                                "existing_sha256": current_baseline[relative]})
             for relative, value in tree_hashes(staged_database).items():
                 entries.append({"area": "database", "path": relative, "source": str(staged_database / relative),
                                 "sha256": value, "existing_sha256": record["database_baseline"].get(relative)})
@@ -507,7 +627,7 @@ def publish_update(data, origin, batch, *, on_diagnostic=None, on_host_key=None,
             record.update(state="built", target=target_binding, build={"version": bundle.version,
                 "bundle": str(bundle.bundle.relative_to(batch)), "metadata": str(bundle.metadata.relative_to(batch)),
                 "songlist_sha256": digest(stage / "songs/songlist"), "entries": entries,
-                "final_assets": tree_hashes(stage)})
+                "final_assets": final_assets})
             write_json(batch / "publish.json", record)
         build = record["build"]
         _check_hashes(stage, build["final_assets"])

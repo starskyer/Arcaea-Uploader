@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 
 from .planner import PlanError, read_json
-from .backgrounds import split_pairs, learn_pairs, merge_pairs
+from .backgrounds import split_pairs, learn_pairs, merge_pairs, new_pairs
 
 
 PATH_KEYS = {
@@ -46,7 +46,7 @@ def default_settings() -> dict:
             "database_relative_path": "latest version/database",
             "private_key_path": "~/.ssh/id_ed25519", "known_hosts_path": "~/.ssh/known_hosts",
         },
-        "api": {"base_url": "", "token_env": "ARCAEA_UPLOADER_API_TOKEN"},
+        "api": {"base_url": "", "token_env": "ARCAEA_UPLOADER_API_TOKEN", "use_system_proxy": True},
     }
 
 
@@ -127,6 +127,24 @@ def effective_settings(data: dict, origin: Path) -> dict:
         local["placeholder_aff"] = str(Path(local["server_project_root"])
                                        / local["database_relative_path"] / "songs" / "sayonarahatsukoi" / "0.aff")
     return result
+
+
+def remember_background_pairs(policy, additions):
+    """Add verified input pairs without replacing an existing decision."""
+    accepted, conflicts = new_pairs(policy["background_pairs"], additions.items(),
+                                    policy["background_pair_conflicts"])
+    policy["background_pairs"].update(accepted)
+    return accepted, conflicts
+
+
+def persist_background_pairs(path, additions):
+    """Only persist the table; retain all other values from the saved profile."""
+    path = Path(path)
+    saved = load_settings(path) if path.is_file() else default_settings()
+    accepted, conflicts = remember_background_pairs(saved["import"], additions)
+    if accepted:
+        save_settings(path, saved)
+    return accepted, conflicts
 
 
 def save_settings(path: Path, data: dict) -> dict:

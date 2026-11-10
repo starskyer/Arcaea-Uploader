@@ -4,6 +4,12 @@ from pathlib import Path
 
 from PIL import Image
 
+from .media import normalize_image
+
+
+HD_SIZE = (1920, 1440)
+STANDARD_SIZES = {HD_SIZE, (1440, 1080), (1280, 960)}
+
 
 def _pair_entries(pairs):
     if not isinstance(pairs, dict):
@@ -64,8 +70,8 @@ def merge_pairs(learned, overrides):
     return normalize_pairs({**retained, **overrides})
 
 
-def learn_pairs(master):
-    """Learn each explicit relationship once, for lookup in both directions."""
+def declared_pairs(master):
+    """Read explicit inverse declarations, before inheritance or inference."""
     entries = []
     for song in master.get("songs", []):
         for scope in (song, *song.get("difficulties", [])):
@@ -73,7 +79,34 @@ def learn_pairs(master):
             if isinstance(bg, str) and bg and isinstance(inverse, str) and inverse:
                 _pair_entries({bg: inverse})
                 entries.append((bg, inverse))
-    return _resolve_entries(entries)
+    return entries
+
+
+def learn_pairs(master):
+    """Learn each explicit relationship once, for lookup in both directions."""
+    return _resolve_entries(declared_pairs(master))
+
+
+def new_pairs(known, entries, ambiguous_ids=()):
+    """Only add isolated pairs; never replace a known or ambiguous partner."""
+    known_ids = pair_lookup(known)
+    entries = list(entries)
+    combined, conflicts = _resolve_entries([*known.items(), *entries])
+    imported_ids = {bg for entry in entries for bg in entry}
+    blocked = set(ambiguous_ids)
+    additions = {a: b for a, b in combined.items()
+                 if a not in known_ids and b not in known_ids and a not in blocked and b not in blocked}
+    conflicts = {bg: values for bg, values in conflicts.items() if bg in imported_ids}
+    for left, right in entries:
+        if left in blocked or right in blocked:
+            conflicts.setdefault(left, [right])
+    return additions, conflicts
+
+
+def normalize_background(source, target):
+    with Image.open(source) as image:
+        size = image.size
+    return normalize_image(source, target, size=size if size in STANDARD_SIZES else HD_SIZE)
 
 
 class BackgroundIndex:
@@ -93,17 +126,20 @@ class BackgroundIndex:
     def route(self, path, log):
         """Check both existing directories before decoding size."""
         path = Path(path)
-        if path.name.casefold() in self.existing_names:
+        name = path.stem + ".jpg"
+        if self.existing_names.intersection({path.name.casefold(), name.casefold()}):
             log("info", "background.skip_existing", f"背景 {path.name} 已存在于 img/bg 或 img/bg/1080，跳过导入。")
             return None
         with Image.open(path) as image:
             size = image.size
-        if size == (1920, 1440):
-            target = "img/bg/1080/" + path.name
+        if size == HD_SIZE:
+            target = "img/bg/1080/" + name
         elif size in {(1440, 1080), (1280, 960)}:
-            target = "img/bg/" + path.name
+            target = "img/bg/" + name
         else:
-            raise ValueError(f"背景 {path.name} 出现新尺寸 {size[0]}×{size[1]}，需人工决定分流。")
+            target = "img/bg/1080/" + name
+            log("info", "background.resize", f"背景 {path.name} 由 {size[0]}×{size[1]} 缩放为 1920×1440，分流至 {target}。")
+            return target
         log("info", "background.route", f"背景 {path.name} 按 {size[0]}×{size[1]} 分流至 {target}。")
         return target
 

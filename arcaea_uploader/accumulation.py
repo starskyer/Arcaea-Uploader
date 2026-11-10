@@ -5,17 +5,18 @@ from copy import deepcopy
 from pathlib import Path
 import shutil
 from tempfile import mkdtemp
-from time import perf_counter
+from time import perf_counter, sleep
 
 from .diagnostics import emit, summarize
 from .import_rules import actual_chart_classes, portable_id
+from .metadata import order_song_fields
 from .planner import PlanError, build_plan, digest, merge_songlist, read_json
 from .preprocess import preprocess_collection, scan_collection
 from .private_files import clone_candidate, copy_writable, replace_copy
 from .review_merge import retain_review_edits
-from .publishing import (_binding, _check_hashes, _config_for_plan, _database, _download_baseline,
-    _log, _render_previews, _safe_roots, apply_prepared_files, load_preparation, tree_hashes)
-from .settings import effective_settings, normalize_settings
+from .publishing import (_binding, _check_hashes, _config_for_plan, _database, _download_baseline, _restore_inferred_policy,
+    _log, _render_previews, _safe_roots, apply_prepared_files, asset_changes, load_preparation, tree_hashes)
+from .settings import effective_settings, normalize_settings, remember_background_pairs
 from .workspaces import (ensure_plain_tree, load_workspace, remove_plain_tree, snapshot_workspace_settings,
                          sync_workspace_task, timestamp, workspace_lock, write_json)
 
@@ -28,25 +29,53 @@ def source_roots(record):
                                            "sha256": record["input_sha256"]}]
 
 
-def check_sources(record):
-    for source in source_roots(record):
-        _check_hashes(Path(source["path"]), source["sha256"])
+def report_source_changes(record, callback, *, incoming=None):
+    """Author packages are provenance; completed imports use private snapshots.
 
-
-def _check_previous_sources(record, incoming):
+    During an explicit 01, the selected source is checked separately before and
+    after copying. Other sources can be edited without invalidating that copy.
+    """
+    reports = []
     for source in source_roots(record):
         path = Path(source["path"])
-        if path.is_relative_to(incoming):
-            continue  # The new explicit 01 will check this entire subtree.
-        current = tree_hashes(path)
-        if incoming.is_relative_to(path):
+        if incoming is not None and path.is_relative_to(incoming):
+            continue
+        try:
+            current = tree_hashes(path)
+        except (OSError, PlanError) as error:
+            reports.append({"path": str(path), "error": str(error)})
+            _log(callback, "info", f"来源目录暂时无法核对：{path}；继续使用已准备的工作区副本。")
+            continue
+        previous = source["sha256"]
+        if incoming is not None and incoming.is_relative_to(path):
             prefix = incoming.relative_to(path).as_posix() + "/"
             current = {k: v for k, v in current.items() if not k.startswith(prefix)}
-            previous = {k: v for k, v in source["sha256"].items() if not k.startswith(prefix)}
-        else:
-            previous = source["sha256"]
-        if current != previous:
-            raise PlanError("先前导入的来源在本次选择范围外发生变化，请先选择该来源执行 01。")
+            previous = {k: v for k, v in previous.items() if not k.startswith(prefix)}
+        changes = asset_changes(previous, current)
+        if changes:
+            reports.append({"path": str(path), "changes": changes})
+            _log(callback, "info", f"来源目录已有修改：{path}；本轮未重新导入的曲目继续使用工作区副本。"
+                 "这些来源修改不会自动进入本批，如需采用请在 02 前选择该来源执行 01。")
+            labels = {"add": "新增", "modify": "修改", "remove": "删除"}
+            for change in changes:
+                _log(callback, "info", f"来源{labels[change['action']]}：{path / change['path']}")
+    return reports
+
+
+def _rename_private(source, target):
+    """Retry transient Windows locks and explain persistent sharing failures."""
+    for delay in (0.0, 0.2, 0.5):
+        if delay:
+            sleep(delay)
+        try:
+            source.rename(target)
+            return
+        except PermissionError as error:
+            if delay == 0.5:
+                raise PlanError(f"无法切换追加目录：{source}\n"
+                    "Windows 拒绝重命名，目录或其中的文件可能正被编辑器、图片/音频播放器或终端占用，"
+                    "也可能没有重命名权限。请先保存并关闭打开此工作区文件的程序及位于其中的终端，"
+                    "再在工作区管理中继续所选批次，重试 01；无需删除工作区或撤销审核修改。") from error
 
 
 def _remove_owned(batch, path):
@@ -85,8 +114,8 @@ def recover_append(batch):
                     destination = attempt / ("uncommitted-" + name)
                     if destination.exists():
                         _remove_owned(batch, destination)
-                    current.rename(destination)
-                previous.rename(current)
+                    _rename_private(current, destination)
+                _rename_private(previous, current)
         for name in METADATA:
             snapshot = attempt / "before" / name
             if not snapshot.is_file():
@@ -107,8 +136,8 @@ def _commit(batch, attempt, record, plan, report):
     write_json(journal, transaction)
     try:
         for name in ("prepared", "songs"):
-            (batch / name).rename(attempt / ("previous-" + name))
-            (attempt / name).rename(batch / name)
+            _rename_private(batch / name, attempt / ("previous-" + name))
+            _rename_private(attempt / name, batch / name)
         for name, value in (("report.json", report), ("plan.json", plan), ("publish.json", record)):
             write_json(batch / name, value)
         transaction["committed"] = True
@@ -183,11 +212,10 @@ def _append_locked(settings, origin, batch, record, raw_settings, callback):
     started = perf_counter()
     _log(callback, "info", "01 追加：核验已有暂存内容与来源…")
     requested_import = normalize_settings(raw_settings, origin)["import"]
-    if requested_import == record.get("requested_import"):
-        settings["import"] = deepcopy(record["binding"]["import"])
+    _restore_inferred_policy(settings, requested_import, record)
     current, previous = _binding(settings), record["binding"]
     if settings["import"]["version"] != previous["import"]["version"]:
-        raise PlanError("同一待发布批次的 version 必须一致；需要其他 version 时请新建批次。")
+        _log(callback, "info", f"本轮导入 version 改为 {settings['import']['version']}；保留已审核的逐曲 version。")
     if (current["bundle"] != previous["bundle"] or any(current["local"][key] != value
             for key, value in previous["local"].items() if key != "input_root")):
         raise PlanError("追加时须沿用原批次的本地资源路径、占位谱面和应用版本选项。")
@@ -199,11 +227,10 @@ def _append_locked(settings, origin, batch, record, raw_settings, callback):
     _check_hashes(assets, record["baseline"], except_paths={"songs/packlist", "songs/unlocks"})
     if _download_baseline(database, record["ids"]) != record["database_baseline"]:
         raise PlanError("本地下载资源基线发生变化，请保留当前审核副本并新建批次。")
-    _check_hashes(batch / "prepared/active", record["prepared_assets"], except_paths={
-        "songs/songlist", "songs/packlist", "songs/unlocks"})
+    reviewed_assets = tree_hashes(batch / "prepared/active")
     _check_hashes(batch / "prepared/database", record["prepared_database"])
     _check_hashes(batch / "songs", record["normalized_sha256"])
-    _check_previous_sources(record, incoming)
+    report_source_changes(record, callback, incoming=incoming)
     previous_report, previous_plan = load_workspace(settings["local"]["release_root"], batch), read_json(batch / "plan.json")
     reviewed = read_json(batch / "prepared/active/songs/songlist")
     merge_songlist(reviewed, [])  # Validate JSON metadata before using it as a baseline.
@@ -223,7 +250,7 @@ def _append_locked(settings, origin, batch, record, raw_settings, callback):
     write_json(batch / "publish.json", record)
     try:
         result = _prepare_candidate(settings, batch, attempt, record, previous_report, previous_plan, reviewed,
-                                    review_hashes, requested_import, callback)
+                                    review_hashes, requested_import, callback, reviewed_assets)
         _log(callback, "info", f"01 追加总耗时 {perf_counter() - started:.1f} 秒。")
         return result
     except Exception as error:
@@ -237,7 +264,7 @@ def _append_locked(settings, origin, batch, record, raw_settings, callback):
         raise
 
 
-def _prepare_candidate(settings, batch, attempt, record, old_report, old_plan, reviewed, review_hashes, requested_import, callback):
+def _prepare_candidate(settings, batch, attempt, record, old_report, old_plan, reviewed, review_hashes, requested_import, callback, reviewed_assets):
     local = settings["local"]
     assets, database, incoming = Path(local["assets_root"]), _database(settings), Path(local["input_root"])
     input_hashes = tree_hashes(incoming)
@@ -262,6 +289,8 @@ def _prepare_candidate(settings, batch, attempt, record, old_report, old_plan, r
     cache = _cache(record, old_report, batch)
     incoming_report = preprocess_collection(incoming, attempt / "preprocessed", existing_songs=downloads / "songs",
         ffmpeg_path=local["ffmpeg_path"], artifact_cache=cache.values(), on_diagnostic=callback, **policy)
+    if incoming_report["valid"]:
+        remember_background_pairs(settings["import"], incoming_report.get("learned_background_pairs", {}))
     candidate_settings = deepcopy(settings)
     candidate_settings["local"].update(assets_root=str(stage), server_project_root=str(attempt / "prepared"),
                                         database_relative_path="database")
@@ -274,14 +303,19 @@ def _prepare_candidate(settings, batch, attempt, record, old_report, old_plan, r
     protected = retain_review_edits(old_plan["merged_songlist"], reviewed, plan["merged_songlist"],
                                    record.get("review_protected_paths", {}), record["ids"])
     merge_songlist(plan["merged_songlist"], [])
-    _log(callback, "info", f"保留人工审核字段 {sum(map(len, protected.values()))} 处（含主动删除的字段）。")
-    apply_prepared_files(plan, stage, downloads, attempt)
-    write_json(stage / "songs/songlist", plan["merged_songlist"])
     ids = list(dict.fromkeys(record["ids"] + [song["id"] for song in plan["songs"]]))
+    for row in plan["merged_songlist"]["songs"]:
+        if row["id"] in ids:
+            order_song_fields(row)
+    _log(callback, "info", f"保留人工审核字段 {sum(map(len, protected.values()))} 处（含主动删除的字段）。")
+    protected_assets = set(record.get("manual_asset_paths", [])) | {
+        item["path"] for item in asset_changes(record["prepared_assets"], reviewed_assets)}
+    apply_prepared_files(plan, stage, downloads, attempt, preserve_assets=protected_assets, callback=callback)
+    write_json(stage / "songs/songlist", plan["merged_songlist"])
     updated = deepcopy(record)
-    updated.update(ids=ids, review_protected_paths=protected,
+    updated.update(ids=ids, review_protected_paths=protected, manual_asset_paths=sorted(protected_assets),
                    actual={sid: sorted(actual_chart_classes(downloads / "songs" / sid)) for sid in ids})
-    _render_previews(attempt, updated, plan["merged_songlist"], local["ffmpeg_path"], callback)
+    _render_previews(attempt, updated, plan["merged_songlist"], local["ffmpeg_path"], callback, preserve_manual=True)
     canonical = attempt / "songs"
     clone_candidate(batch / "songs", canonical)
     normalized = Path(incoming_report["normalized_root"])
@@ -315,6 +349,8 @@ def _prepare_candidate(settings, batch, attempt, record, old_report, old_plan, r
         prepared_database=str(batch / "prepared/database"), files=list(files.values()), actual=updated["actual"],
         songs=[{"id": sid, "idx": rows[sid]["idx"], "kind": "incremental" if sid in original_live else "new"} for sid in ids],
         diagnostics=old_plan["diagnostics"] + plan["diagnostics"], valid=True, publishable=False)
+    combined["learned_background_pairs"] = {**old_plan.get("learned_background_pairs", {}),
+                                           **incoming_report.get("learned_background_pairs", {})}
     emit(combined["diagnostics"], "info", "publication.accumulated",
          f"本次追加 {len(plan['songs'])} 首，批次累计 {len(ids)} 首；未打包 bundle。")
     summarize(combined)
@@ -333,10 +369,7 @@ def _prepare_candidate(settings, batch, attempt, record, old_report, old_plan, r
     updated.pop("pending_append", None)
     _log(callback, "info", "增量资源准备完成；复核来源与审核文档后保存工作区…")
     _check_hashes(incoming, input_hashes)
-    _check_previous_sources(record, incoming)
     _check_hashes(assets, record["baseline"], except_paths={"songs/packlist", "songs/unlocks"})
-    _check_hashes(batch / "prepared/active", record["prepared_assets"], except_paths={
-        "songs/songlist", "songs/packlist", "songs/unlocks"})
     _check_hashes(batch / "prepared/database", record["prepared_database"])
     _check_hashes(batch / "songs", record["normalized_sha256"])
     if _download_baseline(database, ids) != updated["database_baseline"]:
@@ -344,6 +377,7 @@ def _prepare_candidate(settings, batch, attempt, record, old_report, old_plan, r
     for name, expected in review_hashes.items():
         if digest(batch / "prepared/active/songs" / name) != expected:
             raise PlanError("追加期间审核文档再次保存，未覆盖该改动；请关闭编辑器后重试追加。")
+    _check_hashes(batch / "prepared/active", reviewed_assets)
     _commit(batch, attempt, updated, combined, report)
     snapshot_workspace_settings(batch, settings)
     sync_workspace_task(Path(local["release_root"]), batch, combined["merged_songlist"], updated["actual"])

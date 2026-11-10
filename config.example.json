@@ -64,6 +64,7 @@
   },
   "api": {
     "base_url": "https://arcaea.example.com/api/v1",
-    "token_env": "ARCAEA_UPLOADER_API_TOKEN"
+    "token_env": "ARCAEA_UPLOADER_API_TOKEN",
+    "use_system_proxy": true
   }
 }

@@ -88,6 +88,17 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.app.input_var.get(), persisted["local"]["input_root"])
         self.assertEqual(self.app.variables[("import", "version")].get(), "2026.11")
 
+    def test_api_proxy_checkbox_saves_a_boolean_and_preserves_the_other_api_fields(self):
+        flag = self.app.variables[("api", "use_system_proxy")]
+        self.assertIsInstance(flag, tk.BooleanVar)
+        self.assertTrue(flag.get())
+        self.app.variables[("api", "base_url")].set("https://example.test/api/v1")
+        flag.set(False)
+        self.assertTrue(self.app.save())
+        saved = load_settings(self.config)
+        self.assertIs(saved["api"]["use_system_proxy"], False)
+        self.assertEqual(saved["api"]["base_url"], "https://example.test/api/v1")
+
     def test_blank_import_version_reports_error_before_writing(self):
         self.make_package()
         self.app.import_version_var.set("")
@@ -213,7 +224,11 @@ class GuiTests(unittest.TestCase):
         from test_publishing import MemoryUpload, preview
         from arcaea_uploader.publishing import publish_update
         self.make_package()
-        (self.workspace / "incoming/sample/songlist.json").write_text(json.dumps(song_metadata("sample")), encoding="utf-8")
+        row = song_metadata("sample")
+        row.update(bg="new_day", bg_inverse="new_night")
+        (self.workspace / "incoming/sample/songlist.json").write_text(json.dumps(row), encoding="utf-8")
+        for name in ("new_day", "new_night"):
+            Image.new("RGB", (330, 250)).save(self.workspace / f"incoming/sample/{name}.png")
         for name in ("packlist", "unlocks"):
             (self.workspace / "active/songs" / name).write_text("{}", encoding="utf-8")
         history = [{"applicationVersionNumber": "7.0.256", "versionNumber": "7.0.256.4"}]
@@ -221,11 +236,19 @@ class GuiTests(unittest.TestCase):
         self.app.variables[("ssh", "host")].set("example.test")
         self.app.variables[("ssh", "username")].set("ubuntu")
         self.app.variables[("ssh", "server_project_root")].set("/srv/server")
+        self.app.variables[("ssh", "port")].set("2222")
         with patch("arcaea_uploader.publishing.create_preview", side_effect=preview), patch.object(self.app, "open_review") as opened:
             self.app.stage_buttons[0].invoke()
             self.wait_for_check()
             opened.assert_called_once()
             self.assertIsNotNone(self.app.prepared_batch)
+            saved = load_settings(self.config)
+            self.assertEqual(saved["import"]["background_pairs"], {"new_day": "new_night"})
+            self.assertEqual(saved["ssh"]["host"], "", "Pair learning must not save other unsaved fields")
+            self.assertEqual(saved["ssh"]["port"], 22)
+            self.assertEqual(self.app.variables[("ssh", "port")].get(), "2222")
+            self.assertTrue(any(d["code"] == "background.pair_remembered" for d in self.app.result["diagnostics"]))
+            self.assertFalse(self.app.server_ops.context_expired)
             batch = self.app.prepared_batch
             self.assertEqual(self.app.server_ops.task["source"]["path"], self.app.result["review_songlist"])
             def publish(*args, **kwargs):
@@ -259,6 +282,68 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(batch.exists())
         self.assertIsNone(self.app.prepared_batch)
         self.assertEqual(self.app.result["mode"], "committed")
+        panel = self.app.server_ops
+        self.assertTrue(panel.readonly)
+        self.assertEqual(str(panel.execute_button["state"]), "disabled")
+        self.assertEqual(str(panel.purchase_edit_button["state"]), "disabled")
+        self.assertEqual(str(panel.followup_button["state"]), "normal")
+        archive = panel.path
+        before = archive.read_bytes()
+        with patch("arcaea_uploader.server_tasks_gui.ApiClient.from_settings") as client, patch(
+                "arcaea_uploader.server_tasks_gui.messagebox.showinfo"):
+            panel.execute()
+            client.assert_not_called()
+        panel.edit_cell(None)
+        panel.edit_purchase()
+        self.assertIsNone(panel.editor)
+        self.assertIsNone(panel.purchase_editor)
+        self.assertTrue(panel.save())
+        self.assertTrue(panel.refresh_analysis())
+        self.app.close()
+        self.assertEqual(archive.read_bytes(), before)
+
+    def test_archive_followup_is_editable_separate_and_archived_after_success(self):
+        from test_workspace_lifecycle import WorkspaceLifecycleTests
+        from arcaea_uploader.server_tasks import load_task, set_purchase_override
+        from arcaea_uploader.workspaces import commit_workspace
+        from arcaea_uploader.settings import effective_settings
+        fixture = WorkspaceLifecycleTests("test_files_placeholders_constants_and_purchase_plan_stay_together_until_commit")
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        fixture.publish()
+        fixture.finish()
+        history = commit_workspace(fixture.root / "releases", fixture.batch)
+        archive = fixture.root / "releases/.server-tasks" / (fixture.batch.name + ".json")
+        before = archive.read_bytes(), history.read_bytes()
+        self.app._fill(effective_settings(fixture.settings, fixture.root))
+        panel = self.app.server_ops
+        with patch("arcaea_uploader.server_tasks_gui.filedialog.askopenfilename", return_value=str(archive)):
+            panel.open_task()
+        self.assertTrue(panel.readonly)
+        panel.followup_button.invoke()
+        child_path = panel.path
+        self.assertNotEqual(child_path, archive)
+        self.assertFalse(panel.readonly)
+        self.assertEqual(str(panel.execute_button["state"]), "normal")
+        self.assertEqual(str(panel.source_button["state"]), "disabled")
+        self.assertFalse(panel.task["options"]["refresh_resources"])
+        entry = ttk.Entry(self.root)
+        entry.insert(0, "9.9")
+        panel.editor = (entry, "validid", 2)
+        self.assertTrue(panel.commit_editor())
+        set_purchase_override(panel.task, ["validid"], "custom", name="validid", kind="single", price=150)
+        self.assertTrue(panel.save())
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=True), patch(
+                "arcaea_uploader.server_tasks_gui.ApiClient.from_settings", return_value=fixture.api):
+            panel.execute()
+            self.wait_for_check()
+        self.assertTrue(panel.readonly, self.app.details.get("1.0", "end"))
+        self.assertEqual(load_task(child_path)["archive"]["kind"], "followup_complete")
+        self.assertEqual(fixture.api.songs["validid"]["charts"][2]["chart_const"], 9.9)
+        self.assertEqual((archive.read_bytes(), history.read_bytes()), before)
+        self.assertIn("已归档", self.app.summary.get())
+        self.assertNotIn("等待确认提交", panel.hint.get())
+        self.assertEqual(str(panel.execute_button["state"]), "disabled")
 
     def test_tabs_keep_identical_shape_and_padding_when_selected(self):
         style = self.app.style
@@ -320,6 +405,26 @@ class GuiTests(unittest.TestCase):
                 "arcaea_uploader.gui.messagebox.askyesnocancel", return_value=False) as prompt:
             self.app.offer_resume()
         self.assertIn("2 个未提交", prompt.call_args.args[1])
+
+    def test_resume_restores_corrected_version_without_overwriting_it_from_old_report(self):
+        from test_publishing import PublishingTests
+        fixture = PublishingTests("test_complete_two_stage_workflow_with_final_review_preview_and_task")
+        fixture.setUp()
+        def cleanup():
+            fixture.doCleanups()
+            fixture.tearDown()
+        self.addCleanup(cleanup)
+        _, batch = fixture.prepare()
+        path = batch / "publish.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["binding"]["import"]["version"] = "7.2"
+        record["requested_import"]["version"] = "7.2"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(json.loads((batch / "report.json").read_text(encoding="utf-8"))["import_version"], "7.1")
+        with patch.object(self.app, "open_review"):
+            self.app.resume_workspace(batch)
+        self.assertEqual(self.app.import_version_var.get(), "7.2")
+        self.assertEqual(self.app._collect()["import"]["version"], "7.2")
 
     def test_close_saves_a_constant_cell_that_has_not_yet_received_enter(self):
         from arcaea_uploader.server_tasks import load_task
@@ -590,6 +695,50 @@ class GuiTests(unittest.TestCase):
         self.assertIn("sample/2", prompt.call_args.args[1])
         self.assertFalse(self.app.busy)
 
+    def test_purchase_preview_before_upload_refreshes_review_preserves_constants_and_exports(self):
+        panel = self.prepare_stage03()
+        source = Path(panel.task["source"]["path"])
+        panel.task["constants"]["sample"]["2"] = 9.8
+        self.assertIsNone(panel.task["publication"])
+        document = json.loads(source.read_text(encoding="utf-8"))
+        document["songs"][0].update(set="new_pack", purchase="new_pack")
+        source.write_text(json.dumps(document), encoding="utf-8")
+        exported = self.workspace / "purchase-review.json"
+        with patch("arcaea_uploader.server_tasks_gui.ApiClient.from_settings", side_effect=AssertionError("preview is offline")):
+            self.assertTrue(panel.refresh_analysis())
+            rows = panel.purchase_tree.get_children()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(panel.purchase_tree.set(rows[0], "name"), "new_pack")
+            self.assertEqual(panel.purchase_tree.set(rows[0], "price"), "500")
+            self.root.deiconify()
+            self.app.results.select(panel.frame)
+            panel.review_tabs.select(panel.purchase_frame)
+            self.root.update()
+            self.assertTrue(panel.purchase_tree.bbox(panel.purchase_tree.get_children()[0]), "Purchase rows must be visible")
+            self.assertEqual(panel.task["constants"]["sample"]["2"], 9.8)
+            self.assertIsNone(panel.task["publication"])
+            with patch("arcaea_uploader.server_tasks_gui.filedialog.asksaveasfilename", return_value=str(exported)):
+                panel.export_analysis()
+            self.assertEqual(json.loads(exported.read_text(encoding="utf-8"))["purchases"][0]["item"]["type"], "pack")
+            document["songs"][0]["purchase"] = "null"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            self.assertTrue(panel.refresh_analysis())
+            self.assertEqual(panel.purchase_analysis["invalid_songs"][0]["id"], "sample")
+            self.assertEqual(len(panel.purchase_tree.get_children()), 1)
+
+    def test_inline_unrank_constants_are_saved_and_displayed(self):
+        from arcaea_uploader.server_tasks import load_task, missing_constants
+        panel = self.prepare_stage03()
+        for text, expected in (("0.0", 0.0), ("-1", -1.0)):
+            with self.subTest(text=text):
+                entry = ttk.Entry(self.root)
+                entry.insert(0, text)
+                panel.editor = (entry, "sample", 2)
+                self.assertTrue(panel.commit_editor())
+                self.assertEqual(load_task(panel.path)["constants"]["sample"]["2"], expected)
+                self.assertEqual(panel.tree.set("sample", "2"), text)
+                self.assertEqual(missing_constants(panel.task), [])
+
     def test_inline_constant_is_saved_and_stage03_executes_against_fixture_api(self):
         from test_server_tasks import FakeAPI
         from arcaea_uploader.server_tasks import load_task
@@ -613,6 +762,69 @@ class GuiTests(unittest.TestCase):
                 panel.execute()
                 self.wait_for_check()
         self.assertEqual(len(api.writes()) - before, 3, "A fresh manual confirmation must refresh uploaded resources again")
+
+    def test_special_purchase_confirmation_can_cancel_then_skip_and_finish_other_operations(self):
+        from test_server_tasks import FakeAPI
+        panel = self.prepare_stage03()
+        source = Path(panel.task["source"]["path"])
+        document = json.loads(source.read_text(encoding="utf-8"))
+        document["songs"][0]["purchase"] = "null"
+        source.write_text(json.dumps(document), encoding="utf-8")
+        panel.task["constants"]["sample"]["2"] = 9.8
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=False) as prompt, patch(
+                "arcaea_uploader.server_tasks_gui.ApiClient.from_settings") as client:
+            panel.execute()
+            client.assert_not_called()
+        self.assertIn("sample", prompt.call_args.args[1])
+        self.assertIn("null", prompt.call_args.args[1])
+        self.assertIn("跳过", prompt.call_args.args[1])
+        self.assertIsNone(panel.task.get("purchase_skip_confirmation"))
+        api = FakeAPI()
+        with patch("arcaea_uploader.server_tasks_gui.messagebox.askyesno", return_value=True), patch(
+                "arcaea_uploader.server_tasks_gui.ApiClient.from_settings", return_value=api):
+            panel.execute()
+            self.wait_for_check()
+        self.assertEqual(panel.task["state"], "complete", self.app.details.get("1.0", "end"))
+        self.assertFalse(api.purchases)
+        self.assertEqual(panel.purchase_tree.set(panel.purchase_tree.get_children()[0], "state"), "已确认跳过")
+        self.assertEqual(api.songs["sample"]["charts"][2]["chart_const"], 9.8)
+        self.assertEqual(json.loads(source.read_text(encoding="utf-8"))["songs"][0]["purchase"], "null")
+        self.assertTrue(any(entry["level"] == "warning" and "跳过 sample" in entry["message"] for entry in self.app.log_items))
+
+    def test_purchase_editor_saves_custom_skip_and_auto_without_rewriting_songlist(self):
+        from arcaea_uploader.server_tasks import load_task
+        panel = self.prepare_stage03()
+        source = Path(panel.task["source"]["path"])
+        before = source.read_bytes()
+        self.root.deiconify()
+        self.app.results.select(panel.frame)
+        panel.review_tabs.select(panel.purchase_frame)
+        self.root.update()
+        def open_editor():
+            panel.purchase_tree.selection_set(panel.purchase_tree.get_children()[0])
+            panel.edit_purchase()
+            self.assertIsNotNone(panel.purchase_editor)
+            return panel.purchase_editor
+        editor = open_editor()
+        editor["mode"].set("自定义")
+        editor["name"].set("sample")
+        editor["kind"].set("单曲")
+        editor["price"].set("135")
+        editor["apply"]()
+        self.assertIsNone(panel.purchase_editor)
+        self.assertEqual(load_task(panel.path)["purchase_overrides"]["sample"]["price"], 135)
+        self.assertTrue(panel.refresh_analysis())
+        self.assertEqual(panel.task["purchase_candidates"][0]["price"], 135)
+        editor = open_editor()
+        editor["mode"].set("跳过购买项")
+        editor["apply"]()
+        self.assertEqual(len(panel.purchase_analysis["skipped_songs"]), 1)
+        editor = open_editor()
+        editor["mode"].set("自动推导")
+        editor["apply"]()
+        self.assertEqual(panel.task["purchase_overrides"], {})
+        self.assertEqual(len(panel.purchase_analysis["free_songs"]), 1)
+        self.assertEqual(source.read_bytes(), before)
 
 
 if __name__ == "__main__":

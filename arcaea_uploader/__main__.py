@@ -32,9 +32,19 @@ def main(argv=None):
     try:
         if args.command == "preprocess":
             from .preprocess import preprocess_settings
-            from .settings import load_settings
+            from .settings import load_settings, persist_background_pairs
             plan = preprocess_settings(load_settings(args.config), args.config.resolve().parent,
                                        scan_only=args.scan_only, resume_from=args.resume)
+            if not args.scan_only and plan["valid"]:
+                from .diagnostics import emit, summarize
+                saved, conflicts = persist_background_pairs(args.config, plan.get("learned_background_pairs", {}))
+                for left, right in saved.items():
+                    emit(plan["diagnostics"], "info", "background.pair_remembered",
+                         f"已将新背景配对 {left} ↔ {right} 自动记入本地配置。")
+                if conflicts:
+                    emit(plan["diagnostics"], "warning", "background.memory_conflict",
+                         f"本地配对存在冲突，保留原记录：{conflicts}。")
+                summarize(plan)
         else:
             plan = build_plan(resolve_config(args.config))
     except (ValueError, OSError) as exc:

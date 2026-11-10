@@ -18,11 +18,12 @@ import stat
 from tempfile import mkdtemp
 
 from .charts import is_empty_aff, hitsound_files
-from .media import transcode_audio, make_thumbnail
-from .backgrounds import BackgroundIndex, complete_inverse, check_references, split_pairs, learn_pairs, merge_pairs, pair_lookup
+from .media import IMAGE_SUFFIXES, transcode_audio, make_thumbnail, normalize_image
+from .backgrounds import (BackgroundIndex, complete_inverse, check_references, split_pairs, learn_pairs,
+                          merge_pairs, pair_lookup, declared_pairs, new_pairs, normalize_background)
 from .diagnostics import emit, summarize
 from .import_rules import portable_id, require_version, normalize_import_row, actual_chart_classes
-from .metadata import read_author_metadata, strip_trailing_commas as _strip_trailing_commas
+from .metadata import read_author_metadata, order_song_fields, strip_trailing_commas as _strip_trailing_commas
 from .planner import PlanError, check_difficulties, digest, read_json, song_rows
 from .workspaces import (ensure_plain_tree, initialize_workspace, load_workspace,
                          timestamp, workspace_lock, write_json)
@@ -158,6 +159,8 @@ def scan_collection(input_root: Path, *, master: dict | None = None, import_vers
             record["id"] = sid
             if not portable_id(sid):
                 raise PlanError("songlist.id 为空或不符合英文资源 ID 规范；不会改写 ID 或重命名原目录。")
+            record["declared_background_pairs"] = declared_pairs({"songs": [patch]})
+            record["provided_backgrounds"] = []
             if folder.name != sid:
                 log("info", "package.rename_planned", f"标准副本目录将由 {folder.name} 归一为有效 songlist.id：{sid}。")
             if metadata and metadata[0].name != "songlist":
@@ -205,19 +208,19 @@ def scan_collection(input_root: Path, *, master: dict | None = None, import_vers
                         log("info", "audio.preview_ignored", f"跳过已有预览 {path.name}，后续按审核后的时间生成。")
                     else:
                         unknown_audio.append(path)
-                elif path.suffix.casefold() == ".jpg":
-                    target = {"1080_base.jpg": "base.jpg", "1080_base_256.jpg": "base_256.jpg"}.get(name, path.stem + ".jpg")
-                    if re.fullmatch(r"(?:base|[0-4])(?:_256)?\.jpg", name):
-                        target = name
+                elif path.suffix.casefold() in IMAGE_SUFFIXES:
+                    stem = path.stem.casefold()
+                    target = {"1080_base": "base", "1080_base_256": "base_256"}.get(stem, stem) + ".jpg"
                     if not re.fullmatch(r"(?:base|[0-4])(?:_256)?\.jpg", target):
+                        target = path.stem + ".jpg"
+                        record["provided_backgrounds"].append(path.stem.casefold())
                         route = backgrounds.route(path, log)
                         if route is None:
                             continue
-                        add(path, target)
+                        add(path, target, "background")
                         actions[target]["background_target"] = route
                         continue
-                    # Do not inspect or report suffix/encoding mismatches.
-                    add(path, target)
+                    add(path, target, "image")
                 elif name == "video_1080.mp4":
                     add(path, name)
                 else:
@@ -278,6 +281,7 @@ def scan_collection(input_root: Path, *, master: dict | None = None, import_vers
             if "base.jpg" in actions and "base_256.jpg" not in actions:
                 source = Path(actions["base.jpg"]["source"])
                 add(source, "base_256.jpg", "thumbnail")
+                log("info", "image.thumbnail", "缺少 base_256.jpg，将从主曲绘生成 384×384 JPEG 缩略图。")
             for rating in range(5):
                 large, small = f"{rating}.jpg", f"{rating}_256.jpg"
                 if large in actions and small not in actions:
@@ -287,7 +291,6 @@ def scan_collection(input_root: Path, *, master: dict | None = None, import_vers
                     record["missing_fields"].append(f"difficulties[{difficulty['ratingClass']}].rating")
             effective_actual = real_ratings | existing_actual
             normalize_import_row(patch, import_version, effective_actual, log)
-            complete_inverse(patch, background_pairs, log, pair_conflicts)
             record["songlist"] = patch
             record["actions"] = list(actions.values())
             if record["missing_fields"]:
@@ -317,10 +320,24 @@ def scan_collection(input_root: Path, *, master: dict | None = None, import_vers
                 record["status"] = "blocked"
     available_bg = backgrounds.existing_ids | {Path(a["background_target"]).stem.casefold()
         for r in report["packages"] if r["status"] == "ready" for a in r["actions"] if "background_target" in a}
+    entries = [(a, b) for r in report["packages"] if r["status"] == "ready"
+               for a, b in r.get("declared_background_pairs", [])
+               if {a.casefold(), b.casefold()} <= set(r.get("provided_backgrounds", []))]
+    learned, conflicts = new_pairs(background_pairs, entries, pair_conflicts)
+    report["learned_background_pairs"] = learned
+    if conflicts:
+        emit(report["diagnostics"], "warning", "background.pair_conflict",
+             f"输入背景配对与已有记录冲突或不满足一一配对，保留已有对应表，未自动记忆：{conflicts}。", callback=on_diagnostic)
+    for left, right in learned.items():
+        emit(report["diagnostics"], "info", "background.pair_discovered",
+             f"从明确的 bg / bg_inverse 及两张背景图片识别新配对：{left} ↔ {right}；准备成功后可记忆。", callback=on_diagnostic)
+    effective_pairs = {**background_pairs, **learned}
     for record in report["packages"]:
         def record_log(level, code, message):
             emit(record["diagnostics"], level, code, message, song_id=record["id"], source=record["source"], callback=on_diagnostic)
         if record["songlist"]:
+            complete_inverse(record["songlist"], effective_pairs, record_log, {**pair_conflicts, **conflicts})
+            order_song_fields(record["songlist"])
             check_references(record["songlist"], available_bg, record_log)
         for error in record["errors"]:
             record_log("error", "package.invalid", error)
@@ -474,6 +491,10 @@ def _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_di
                     make_thumbnail(source, target)
                 elif action["kind"] == "transcode":
                     transcode_audio(source, target, ffmpeg_path=ffmpeg_path)
+                elif action["kind"] == "image":
+                    normalize_image(source, target)
+                elif action["kind"] == "background":
+                    normalize_background(source, target)
                 else:
                     shutil.copyfile(source, target)
                 if digest(source) != action["source_sha256"]:
@@ -511,7 +532,7 @@ def _materialize_batch(report, batch, previous, context_hash, ffmpeg_path, on_di
 
 def preprocess_settings(data: dict, origin: Path, *, scan_only: bool = False, on_diagnostic=None,
                         resume_from: Path | None = None) -> dict:
-    from .settings import effective_settings
+    from .settings import effective_settings, remember_background_pairs
     config = effective_settings(data, origin)
     local = config["local"]
     if not local["input_root"]:
@@ -531,6 +552,8 @@ def preprocess_settings(data: dict, origin: Path, *, scan_only: bool = False, on
         raise PlanError("请先在配置页指定发布工作区。")
     report = preprocess_collection(Path(local["input_root"]), Path(local["release_root"]),
                                    ffmpeg_path=local["ffmpeg_path"], resume_from=resume_from, **options)
+    if report["valid"]:
+        remember_background_pairs(config["import"], report.get("learned_background_pairs", {}))
     from .workspaces import snapshot_workspace_settings
     with workspace_lock(local["release_root"], report["batch_root"]):
         snapshot_workspace_settings(report["batch_root"], config)

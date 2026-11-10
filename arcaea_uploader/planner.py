@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from .charts import is_empty_aff, hitsound_files
-from .metadata import read_author_metadata
+from .metadata import read_author_metadata, order_song_fields
 from .import_rules import (portable_id, require_version, normalize_import_row, actual_chart_classes,
                            validate_rating_values)
 from .backgrounds import BackgroundIndex, complete_inverse, check_references, split_pairs, learn_pairs, merge_pairs, pair_lookup
@@ -112,6 +112,7 @@ def merge_songlist(master: dict, patches: list[dict], *, import_version=None, ac
         import_version = require_version(import_version)
 
     def finalize(row):
+        order_song_fields(row)
         if import_version is None:
             return
         sid = row["id"]
@@ -119,6 +120,7 @@ def merge_songlist(master: dict, patches: list[dict], *, import_version=None, ac
             d["ratingClass"] for d in row.get("difficulties", []) if d.get("rating", -1) >= 0}
         normalize_import_row(row, import_version, actual, lambda level, code, message:
             emit(diagnostics if diagnostics is not None else [], level, code, message, song_id=sid))
+        order_song_fields(row)
     for patch in patches:
         song_id = patch.get("id")
         if not portable_id(song_id) or song_id in seen_patches:
@@ -323,6 +325,7 @@ def build_plan(config: dict) -> dict:
     for sid in incoming:
         complete_inverse(rows[sid], pairs, lambda level, code, message, song_id=sid:
                          emit(plan["diagnostics"], level, code, message, song_id=song_id), pair_conflicts)
+        order_song_fields(rows[sid])
     claimed_targets: dict[tuple[str, str], str] = {}
 
     def add_file(source: Path, area: str, relative: str, media: bool = False, placeholder: bool = False):
@@ -383,7 +386,7 @@ def build_plan(config: dict) -> dict:
                             emit(plan["diagnostics"], level, code, message, song_id=song_id, source=path))
                         if relative is None:
                             continue
-                        add_file(path, "assets", relative)
+                        add_file(path, "assets", relative, media=True)
                 elif path.suffix == ".ogg":
                     add_file(path, "assets", f"songs/dl_{song_id}/{path.name}", media=True)
             for rating in range(3):

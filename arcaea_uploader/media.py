@@ -21,6 +21,35 @@ class MediaError(ValueError):
     """Invalid media settings or failed FFmpeg processing."""
 
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
+
+def normalize_image(source: Path, target: Path, *, size=None):
+    """Write a real JPEG in a private copy; composite transparency onto white."""
+    source, target = Path(source), Path(target)
+    if source.resolve() == target.resolve():
+        raise MediaError("图片源文件与输出文件必须分开。")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".image-", dir=target.parent) as temp:
+        staged = Path(temp) / target.name
+        with Image.open(source) as image:
+            if image.format == "JPEG" and image.mode == "RGB" and (size is None or image.size == size):
+                image.verify()
+                shutil.copyfile(source, staged)
+            else:
+                if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                    rgba = image.convert("RGBA")
+                    output = Image.new("RGB", image.size, "white")
+                    output.paste(rgba, mask=rgba.getchannel("A"))
+                else:
+                    output = image.convert("RGB")
+                if size is not None and output.size != size:
+                    output = output.resize(size, Image.Resampling.LANCZOS)
+                output.save(staged, format="JPEG", quality=90, optimize=True)
+        staged.replace(target)
+    return target
+
+
 def resolve_ffmpeg(configured: str = "") -> str:
     value = configured.strip() or "ffmpeg"
     found = shutil.which(value)
@@ -75,34 +104,15 @@ is finalized. They are not implicitly renamed to an invented 1080_* form.
     if target.exists() and not replace:
         raise FileExistsError(target)
     destination.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix=".jacket-", dir=destination) as temp:
-        staged = Path(temp) / name
-        with Image.open(source) as image:
-            if source.stem.endswith("_256") and image.size != (384, 384):
-                image.resize((384, 384), Image.Resampling.LANCZOS).save(staged, format=image.format, quality=90, optimize=True)
-            else:
-                image.verify()
-                shutil.copyfile(source, staged)
-        staged.replace(target)
-    return target
+    return normalize_image(source, target, size=(384, 384) if source.stem.endswith("_256") else None)
 
 
 def make_thumbnail(source: Path, target: Path):
-    """Create a missing thumbnail while preserving the source image encoding.
-
-    An extension/encoding difference is deliberately neither fixed nor logged.
-    Existing files are copied by preprocessing; resizing remains an explicit job.
-    """
+    """Create a missing 384×384 JPEG thumbnail without changing the source."""
     source, target = Path(source), Path(target)
     if target.exists() or source.resolve() == target.resolve():
         raise FileExistsError(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix=".thumbnail-", dir=target.parent) as temp:
-        staged = Path(temp) / target.name
-        with Image.open(source) as image:
-            image.resize((384, 384), Image.Resampling.LANCZOS).save(staged, format=image.format, quality=90, optimize=True)
-        staged.replace(target)
-    return target
+    return normalize_image(source, target, size=(384, 384))
 
 
 def preview_interval(song: dict, rating_class: int | None = None) -> tuple[int, int]:

@@ -3,11 +3,20 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from arcaea_uploader.backgrounds import complete_inverse, learn_pairs, merge_pairs, normalize_pairs, pair_lookup
+from arcaea_uploader.backgrounds import complete_inverse, learn_pairs, merge_pairs, normalize_pairs, pair_lookup, new_pairs
 from arcaea_uploader.settings import load_settings, save_settings
 
 
 class UndirectedBackgroundTests(unittest.TestCase):
+    def test_learning_rejects_entire_ambiguous_component_and_preserves_known_pairs(self):
+        known = {"old": "confirmed"}
+        additions, conflicts = new_pairs(known, [("old", "new"), ("day", "night"),
+                                                ("a", "b"), ("b", "c")])
+        self.assertEqual(additions, {"day": "night"})
+        self.assertEqual(known, {"old": "confirmed"})
+        self.assertTrue({"old", "new", "a", "b", "c"} <= conflicts.keys())
+        self.assertEqual(new_pairs({}, [("blocked", "candidate")], {"blocked"})[0], {})
+
     def test_one_entry_resolves_both_directions_without_suffix_inference(self):
         pairs = {"zettai": "zettai_light"}
         for bg, expected in (("zettai", "zettai_light"), ("zettai_light", "zettai")):
